@@ -1,0 +1,19 @@
+# Safe default: report available updates without changing anything.
+policy = "notify"
+
+check_core = true
+check_plugins = true
+startup_check = true
+
+# Only an installed commit that is behind its upstream branch may update.
+require_fast_forward = true
+immutable_pins = true
+
+# Core protocol changes need a staged fleet rollout or an explicit CLI flag.
+allow_protocol_change = false
+
+# Empty means all GitHub sources are eligible. Narrow these for auto mode.
+# allow = ["diegopzz/herdr-*"]
+# trusted_owners = ["diegopzz"]
+
+max_concurrency = 8

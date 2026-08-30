@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: herdr-updater
+          - os: macos-13
+            target: x86_64-apple-darwin
+            executable: herdr-updater
+          - os: macos-14
+            target: aarch64-apple-darwin
+            executable: herdr-updater
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: herdr-updater.exe
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package="$RUNNER_TEMP/package"
+          mkdir -p "$package"
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$package/${{ matrix.executable }}"
+          tar -C "$package" -czf "herdr-updater-$version-${{ matrix.target }}.tar.gz" "${{ matrix.executable }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: herdr-updater-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $lines = Get-ChildItem -LiteralPath dist -Filter 'herdr-updater-*.tar.gz' |
+            Sort-Object Name |
+            ForEach-Object { "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name }
+          $lines | Set-Content -LiteralPath "dist/checksums-$version.txt" -Encoding utf8NoBOM
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem -LiteralPath dist | Sort-Object Name | ForEach-Object FullName
+          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes --title $env:GITHUB_REF_NAME @assets

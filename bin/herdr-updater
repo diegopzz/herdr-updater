@@ -1,0 +1,69 @@
+#!/bin/sh
+set -eu
+
+VERSION="0.1.0"
+REPOSITORY="diegopzz/herdr-updater"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+if [ -x "$ROOT/target/release/herdr-updater" ]; then
+    exec "$ROOT/target/release/herdr-updater" "$@"
+fi
+
+os=$(uname -s)
+arch=$(uname -m)
+case "$os/$arch" in
+    Linux/x86_64) target="x86_64-unknown-linux-gnu" ;;
+    Darwin/x86_64) target="x86_64-apple-darwin" ;;
+    Darwin/arm64|Darwin/aarch64) target="aarch64-apple-darwin" ;;
+    *)
+        printf 'herdr-updater: no prebuilt binary for %s/%s\n' "$os" "$arch" >&2
+        exit 2
+        ;;
+esac
+
+asset="herdr-updater-$VERSION-$target.tar.gz"
+cache="$ROOT/bin/.cache/$VERSION"
+binary="$cache/herdr-updater"
+if [ ! -x "$binary" ]; then
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-updater.XXXXXX")
+    trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
+    checksums="checksums-$VERSION.txt"
+    if command -v gh >/dev/null 2>&1; then
+        gh release download "v$VERSION" --repo "$REPOSITORY" \
+            --pattern "$asset" --pattern "$checksums" --dir "$tmp"
+    elif command -v curl >/dev/null 2>&1; then
+        base="https://github.com/$REPOSITORY/releases/download/v$VERSION"
+        curl -fsSL --proto '=https' --tlsv1.2 "$base/$asset" -o "$tmp/$asset"
+        curl -fsSL --proto '=https' --tlsv1.2 "$base/$checksums" -o "$tmp/$checksums"
+    else
+        printf 'herdr-updater: gh or curl is required for the first run\n' >&2
+        exit 2
+    fi
+
+    expected=$(awk -v file="$asset" '$2 == file { print $1; exit }' "$tmp/$checksums")
+    if [ -z "$expected" ]; then
+        printf 'herdr-updater: release checksum does not list %s\n' "$asset" >&2
+        exit 2
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$tmp/$asset")
+    else
+        actual=$(shasum -a 256 "$tmp/$asset")
+    fi
+    actual=${actual%% *}
+    if [ "$actual" != "$expected" ]; then
+        printf 'herdr-updater: checksum verification failed for %s\n' "$asset" >&2
+        exit 2
+    fi
+
+    tar -xzf "$tmp/$asset" -C "$tmp"
+    if [ ! -f "$tmp/herdr-updater" ]; then
+        printf 'herdr-updater: release archive is missing the executable\n' >&2
+        exit 2
+    fi
+    mkdir -p "$cache"
+    install -m 0755 "$tmp/herdr-updater" "$binary.tmp"
+    mv -f "$binary.tmp" "$binary"
+fi
+
+exec "$binary" "$@"

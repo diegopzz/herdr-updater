@@ -1,0 +1,78 @@
+id = "herdr-updater"
+name = "Herdr Updater"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Safely check and update Herdr core and installed plugins, with fleet drift reporting"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+platforms = ["linux", "macos"]
+command = ["sh", "scripts/install-cli.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/install-cli.ps1"]
+
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "startup"]
+
+[[startup]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "startup"]
+
+[[actions]]
+id = "check"
+title = "Check Herdr and plugin updates"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "check"]
+
+[[actions]]
+id = "plan"
+title = "Plan Herdr and plugin updates"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "plan"]
+
+[[actions]]
+id = "apply"
+title = "Apply safe Herdr and plugin updates"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "apply"]
+
+[[actions]]
+id = "fleet"
+title = "Check Herdr fleet drift"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "fleet"]
+
+[[actions]]
+id = "check-windows"
+title = "Check Herdr and plugin updates"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "check"]
+
+[[actions]]
+id = "plan-windows"
+title = "Plan Herdr and plugin updates"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "plan"]
+
+[[actions]]
+id = "apply-windows"
+title = "Apply safe Herdr and plugin updates"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "apply"]
+
+[[actions]]
+id = "fleet-windows"
+title = "Check Herdr fleet drift"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "fleet"]

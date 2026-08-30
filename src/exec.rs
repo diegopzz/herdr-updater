@@ -93,15 +93,25 @@ pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<Output, Ex
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = out_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-                let stderr = err_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-                return Ok(Output { code: status.code().unwrap_or(-1), stdout, stderr });
+                let stdout = out_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_default();
+                let stderr = err_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_default();
+                return Ok(Output {
+                    code: status.code().unwrap_or(-1),
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(ExecError::Timeout { secs: timeout.as_secs() });
+                    return Err(ExecError::Timeout {
+                        secs: timeout.as_secs(),
+                    });
                 }
                 thread::sleep(Duration::from_millis(20));
             }
@@ -133,7 +143,10 @@ mod tests {
     #[test]
     fn kills_a_child_that_outlives_the_deadline() {
         let e = run("/bin/sh", &["-c", "sleep 30"], Duration::from_millis(300)).unwrap_err();
-        assert!(matches!(e, ExecError::Timeout { .. }), "expected Timeout, got {e:?}");
+        assert!(
+            matches!(e, ExecError::Timeout { .. }),
+            "expected Timeout, got {e:?}"
+        );
     }
 
     #[cfg(unix)]

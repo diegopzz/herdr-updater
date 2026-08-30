@@ -1,138 +1,156 @@
 # herdr-updater
 
-Keep [herdr](https://herdr.dev) **and** its plugins current across a whole
-fleet — not just the machine you happen to be sitting at.
+An original Herdr plugin and standalone Rust CLI by **diegopzz**. It keeps
+Herdr core and installed Herdr plugins current without silently overwriting
+local forks, crossing protocol boundaries, or turning a failed network check
+into a false green result.
 
-> Status: **v0.1, early.** `check` and `fleet` are implemented and verified
-> against a real four-host fleet. Plugin updates, `plan`/`apply` and rollback
-> are next; see [Roadmap](#roadmap). This version cannot write anything.
+The default policy is `notify`: every command may inspect, but nothing updates
+until you explicitly opt into `policy = "auto"`.
 
-## Why this exists
+## What it covers
 
-herdr carries a wire protocol version, and that version is what
-`herdr --remote` negotiates on. Once you run herdr on more than one machine,
-the failure that actually costs you a day is not "a plugin is out of date" —
-it is **drift**: several hosts quietly running different versions, every one of
-them individually healthy, every check green.
+- Herdr core version, protocol, server state, and live-handoff capability.
+- Every plugin reported by `herdr plugin list --json`.
+- GitHub branch/default-ref updates, classified with `gh` first and the public
+  GitHub API only as a fallback.
+- Immutable tag and commit pins.
+- Linked plugin checkouts and forks, which are reported but never reinstalled.
+- Cross-host core and plugin drift using SSH aliases from `hosts.toml`.
+- Append-only update history plus plugin rollback and resume.
+- Linux, macOS, and Windows release binaries with SHA-256 verification.
 
-Here is that failure, real output, first run:
+## Safety model
 
-```
-$ herdr-updater fleet
-fleet (from /root/.config/herdr-mirror/hosts.toml)
+`herdr-updater` applies only an installed GitHub plugin revision that is an
+ancestor of its upstream branch revision. Ahead, diverged, pinned, linked,
+unmanaged, rate-limited, unreachable, and otherwise unknown states are held.
 
-  HOST             HERDR            PROTOCOL  SERVER
-  this machine     0.8.2            20        running
-  macbook          0.8.2            20        running
-  portatil         0.7.5-preview…   18        running
-  ts-ubuntu        0.8.2            20        running
+Herdr core updates have two additional gates:
 
-  ⚠ PROTOCOL SPLIT — hosts are on different herdr protocols.
-    `herdr --remote` negotiates on this, so a local client cannot attach to a
-    remote server across the split.
-    herdr-mirror is NOT affected the same way: it runs the remote host's own
-    herdr binary, so both ends of that conversation already match.
-    Update before relying on --remote, and close the drift regardless.
-```
+1. A running server must advertise live handoff.
+2. A protocol change is held unless it is explicitly allowed as part of a
+   staged rollout (`allow_protocol_change = true` or
+   `--allow-protocol-change`).
 
-Four hosts, three agreeing, one silently two protocol versions behind. **Drift
-is the product here**, not a side effect of an update run.
+After a core update, the CLI verifies the client/server version and refreshes
+outdated built-in agent integrations. After a plugin reinstall, it re-reads the
+plugin registry, verifies the resolved commit, and exercises action discovery.
+
+Every subprocess has a hard deadline and receives an argv array. User-derived
+owners, repositories, refs, subdirectories, and SSH aliases are validated
+before they become arguments or URLs.
 
 ## Install
 
-```bash
-git clone https://github.com/diegopzz/herdr-updater
-cd herdr-updater
-cargo build --release
-./target/release/herdr-updater fleet
+After the first release:
+
+```sh
+herdr plugin install diegopzz/herdr-updater
 ```
 
-Prebuilt release binaries land with v0.2, so hosts without a Rust toolchain can
-run it — a real constraint, not a hypothetical: one macOS host in the test
-fleet has no cargo at all.
+No Rust toolchain is required for a release install. The plugin launcher
+downloads the matching GitHub release binary on first use and verifies it
+against `checksums-<version>.txt`. The install step also places the standalone
+`herdr-updater` binary in `~/.local/bin` on Unix or WindowsApps on Windows.
+
+For local development:
+
+```sh
+cargo build --release
+herdr plugin link /path/to/herdr-updater
+herdr plugin action list --plugin herdr-updater
+```
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `check` | herdr core on this host vs `herdr.dev/latest.json` |
-| `fleet` | the same check across every configured host, as a drift report |
-| `version` | print the tool version |
+| Command | Behavior |
+| --- | --- |
+| `check` | Inspect core and plugins; never mutate. |
+| `plan` | Show `CURRENT`, `UPDATE`, `HOLD`, or `ERROR` for each target. |
+| `apply` / `update` | Execute `UPDATE` decisions only when policy is `auto`. |
+| `fleet` | Report core version/protocol and plugin inventory drift over SSH. |
+| `history` | Read the append-only `state.jsonl` audit log. |
+| `rollback` | Reinstall a plugin at its pre-update commit and pin it there. |
+| `resume` | Return a rolled-back plugin to its recorded branch/default ref. |
+| `startup` | Check on Herdr startup; in `auto`, update plugins but never core. |
 
-Flags: `--json`, `--timeout <secs>` (default 20), `--hosts a,b` (fleet only).
+Common options:
 
-### Exit codes
+```text
+--json
+--timeout <seconds>
+--config <path>
+--only <plugin-id>
+--hosts <alias,alias>
+--core-only
+--plugins-only
+--allow-protocol-change
+```
+
+Exit codes are stable for scripts:
 
 | Code | Meaning |
-|---|---|
-| `0` | nothing to do |
-| `1` | updates available, or drift detected |
-| `2` | a check **errored** — the answer is unknown, not "up to date" |
-| `3` | usage error |
+| --- | --- |
+| `0` | No action needed, or requested mutation succeeded. |
+| `1` | An update needs attention, nothing can roll back/resume, or apply failed. |
+| `2` | A check is unknown or config/state is invalid. |
+| `3` | Command-line usage error. |
 
 ## Configuration
 
-Fleet hosts are read from the first of these that exists:
+Copy [`config.example.toml`](config.example.toml) to the directory printed by:
+
+```sh
+herdr plugin config-dir herdr-updater
+```
+
+Minimal opt-in configuration:
+
+```toml
+policy = "auto"
+trusted_owners = ["diegopzz"]
+allow = ["diegopzz/herdr-*"]
+```
+
+An empty allowlist means all valid GitHub plugin sources are eligible, while
+`trusted_owners` narrows that set by owner. Tag/commit pins remain immutable.
+Fast-forward-only enforcement cannot be disabled.
+
+## Fleet inventory
+
+`fleet` reads the first existing file:
 
 1. `~/.config/herdr-updater/hosts.toml`
 2. `~/.config/herdr-mirror/hosts.toml`
 
-Reusing herdr-mirror's file is deliberate: if you already mirror a host, you
-have already told the system it exists. The report always prints which file it
-read — "which config won?" should never be a guess.
+The shared shape is intentionally small:
 
 ```toml
-[hosts.macbook]
-target = "macbook"      # ssh alias; defaults to the table key
+[hosts.laptop]
+target = "laptop"
 
-[hosts.ts-ubuntu]
-target = "ts-ubuntu"
+[hosts.server]
+target = "server"
 ```
 
-Any other keys in that file (`always_control`, `poll_seconds`, …) are ignored,
-not rejected.
+Targets are SSH aliases, so ProxyJump/ProxyCommand and keys stay in
+`~/.ssh/config`; this repository contains no credentials. Fleet mode is
+read-only. A host that cannot return either core status or plugin inventory is
+unknown and excluded from agreement claims.
 
-## Design rules
+## Development
 
-These are load-bearing, not style preferences:
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
 
-- **Every subprocess is argv, never a shell string.** Host aliases and plugin
-  ids come from config files and from herdr's own output. Interpolating them
-  into `sh -c` would make a repo named `; rm -rf ~` a code path. Aliases are
-  additionally validated so a value can never grow into an ssh *option*.
-- **Every subprocess has a hard wall-clock deadline.** This is meant to run at
-  herdr *startup*; a wedged `ssh` against a dead network must not hang the
-  terminal you are opening.
-- **Unknown degrades to "unknown", never to "fine".** A host we could not read
-  is excluded from the drift verdict and reported, not quietly counted as
-  agreeing. A failed version check never becomes an update.
-- **Warnings must not overstate blast radius.** An early draft of the protocol
-  warning claimed a split stops mirrors working. Measurement disproved it: a
-  protocol 18 host mirrors cleanly from a protocol 20 host, because
-  herdr-mirror runs the remote host's *own* binary. A warning that overstates
-  damage gets disabled, and then it protects nothing.
-- **No unattended writes.** v0.1 cannot write at all. When apply lands, the
-  default policy stays `notify`.
-
-## Roadmap
-
-- [x] herdr core version/protocol check, local and fleet-wide
-- [x] Drift report with `--json` and scriptable exit codes
-- [ ] Plugin registry check against upstream refs (`git ls-remote`), with
-      branch/tag/commit channel classification
-- [ ] `plan` / `apply`, fast-forward-only, `notify` by default
-- [ ] `herdr update --handoff` orchestration, gated on the server's advertised
-      `live_handoff` capability, **plus the mandatory post-update
-      `herdr integration install <agent>`** — skipping that leaves agent hooks
-      stale, which looks exactly like a broken integration
-- [ ] Linked / forked plugin support: fetch, compare, and never reinstall over
-      a local fork
-- [ ] Streamer-safe binary replacement for herdr-mirror (pause, replace,
-      restart) — replacing that binary under live streamers is a known breakage
-- [ ] Post-update verification: exercise the plugin instead of trusting the
-      installer's exit code
-- [ ] Prebuilt release binaries with SHA256 verification + herdr plugin manifest
+The crate deliberately keeps a small dependency surface: `serde`,
+`serde_json`, and `toml`, all pinned by `Cargo.lock`.
 
 ## License
 
-MIT
+MIT © 2026 diegopzz
