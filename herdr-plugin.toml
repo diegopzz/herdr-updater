@@ -2,7 +2,7 @@ id = "herdr-updater"
 name = "Herdr Updater"
 version = "0.1.0"
 min_herdr_version = "0.8.2"
-description = "Safely check and update Herdr core and installed plugins, with fleet drift reporting"
+description = "Update Herdr safely with a plugin store, fleet sync, schedules, drift checks, and rollback"
 platforms = ["linux", "macos", "windows"]
 
 [[build]]
@@ -50,6 +50,27 @@ platforms = ["linux", "macos"]
 command = ["sh", "bin/herdr-updater", "fleet"]
 
 [[actions]]
+id = "open-store"
+title = "Browse and install Herdr plugins"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "open-store"]
+
+[[actions]]
+id = "sync-plan"
+title = "Plan plugin sync across connected hosts"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "sync", "plan"]
+
+[[actions]]
+id = "schedule-status"
+title = "Show Herdr update schedule"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "schedule", "status"]
+
+[[actions]]
 id = "check-windows"
 title = "Check Herdr and plugin updates"
 contexts = ["workspace"]
@@ -76,3 +97,42 @@ title = "Check Herdr fleet drift"
 contexts = ["workspace"]
 platforms = ["windows"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "fleet"]
+
+[[actions]]
+id = "open-store-windows"
+title = "Browse and install Herdr plugins"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "open-store"]
+
+[[actions]]
+id = "sync-plan-windows"
+title = "Plan plugin sync across connected hosts"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "sync", "plan"]
+
+[[actions]]
+id = "schedule-status-windows"
+title = "Show Herdr update schedule"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "schedule", "status"]
+
+[[panes]]
+id = "store"
+title = "Herdr Plugin Store"
+placement = "popup"
+width = "90%"
+height = "80%"
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "store"]
+
+[[panes]]
+id = "store-windows"
+title = "Herdr Plugin Store"
+placement = "popup"
+width = "90%"
+height = "80%"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "store"]

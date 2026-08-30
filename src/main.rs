@@ -5,12 +5,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+mod catalog;
 mod config;
 mod exec;
 mod fleet;
 mod herdr;
 mod history;
 mod plugins;
+mod schedule;
+mod sync;
 
 const USAGE: &str = "\
 herdr-updater -- keep Herdr core and plugins current without overwriting forks
@@ -24,6 +27,12 @@ COMMANDS
     apply       execute safe UPDATE decisions when policy = \"auto\"
     update      alias for apply
     fleet       report Herdr and plugin drift across configured SSH hosts
+    search      search the Herdr plugin marketplace
+    install     install a marketplace plugin by id or owner/repo[/subdir]
+    store       run the keyboard-driven plugin store inside a Herdr pane
+    open-store  open the plugin store popup in the current Herdr session
+    sync        plan/apply/export desired plugin state across connected hosts
+    schedule    run/install/status/remove configurable background checks
     history     print the append-only update/rollback audit log
     rollback    pin plugin(s) to the revision before their latest update
     resume      move rolled-back plugin(s) back to their recorded tracking ref
@@ -39,6 +48,10 @@ OPTIONS
     --core-only                 skip plugin inspection
     --plugins-only              skip Herdr core inspection
     --allow-protocol-change     explicitly allow a local core protocol change
+    --sort <mode>               marketplace: relevance, stars, trending, recent, name
+    --limit <count>             marketplace result limit (default 50, max 500)
+    --refresh                   refresh the marketplace cache before use
+    -y, --yes                   confirm marketplace install or fleet reconciliation
     -h, --help                  show this text
 
 EXIT CODES
@@ -59,6 +72,11 @@ struct Args {
     core_only: bool,
     plugins_only: bool,
     allow_protocol_change: bool,
+    operands: Vec<String>,
+    sort: catalog::SortMode,
+    limit: usize,
+    refresh: bool,
+    yes: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -76,6 +94,11 @@ fn parse() -> Result<Args, String> {
         core_only: false,
         plugins_only: false,
         allow_protocol_change: false,
+        operands: Vec::new(),
+        sort: catalog::SortMode::Relevance,
+        limit: 50,
+        refresh: false,
+        yes: false,
     };
     let mut iter = raw.into_iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -107,7 +130,23 @@ fn parse() -> Result<Args, String> {
             "--core-only" => args.core_only = true,
             "--plugins-only" => args.plugins_only = true,
             "--allow-protocol-change" => args.allow_protocol_change = true,
-            other => return Err(format!("unknown option: {other}")),
+            "--sort" => {
+                let value = iter.next().ok_or("--sort needs a value")?;
+                args.sort = catalog::SortMode::parse(&value)?;
+            }
+            "--limit" => {
+                let value = iter.next().ok_or("--limit needs a value")?;
+                args.limit = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--limit: {value:?} is not a number"))?;
+                if args.limit == 0 || args.limit > 500 {
+                    return Err("--limit must be between 1 and 500".into());
+                }
+            }
+            "--refresh" => args.refresh = true,
+            "-y" | "--yes" => args.yes = true,
+            other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
+            operand => args.operands.push(operand.to_string()),
         }
     }
     if args.core_only && args.plugins_only {
@@ -602,6 +641,138 @@ fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32
     i32::from(!failures.is_empty())
 }
 
+fn startup_run(args: &Args, loaded: &config::Loaded) -> i32 {
+    let config_dir = loaded
+        .path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match schedule::check_due(config_dir, &loaded.value) {
+        Ok(false) => return 0,
+        Err(error) => {
+            eprintln!("herdr-updater: {error}");
+            return 2;
+        }
+        Ok(true) => {}
+    }
+    let mut lease = match schedule::begin(config_dir) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return 0,
+        Err(error) => {
+            eprintln!("herdr-updater: {error}");
+            return 2;
+        }
+    };
+    match schedule::quiet_now(&loaded.value, args.timeout) {
+        Ok(true) => {
+            if let Err(error) = lease.defer_for_quiet_hours(&loaded.value) {
+                eprintln!("herdr-updater: {error}");
+                return 2;
+            }
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("herdr-updater: {error}");
+            return 2;
+        }
+        Ok(false) => {}
+    }
+    let code = apply_report(args, loaded, true);
+    let successful = if loaded.value.policy == config::Policy::Notify {
+        code <= 1
+    } else {
+        code == 0
+    };
+    if let Err(error) = lease.finish(&loaded.value, code, successful, false) {
+        eprintln!("herdr-updater: {error}");
+        return 2;
+    }
+    code
+}
+
+fn scheduled_run(args: &Args, loaded: &config::Loaded) -> i32 {
+    let config_dir = loaded
+        .path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match schedule::check_due(config_dir, &loaded.value) {
+        Ok(false) => {
+            if !args.json {
+                println!("scheduled check is not due yet");
+            }
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("herdr-updater: {error}");
+            return 2;
+        }
+        Ok(true) => {}
+    }
+    let mut lease = match schedule::begin(config_dir) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            if !args.json {
+                println!("another scheduled check is already running");
+            }
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("herdr-updater: {error}");
+            return 2;
+        }
+    };
+    match schedule::quiet_now(&loaded.value, args.timeout) {
+        Ok(true) => {
+            if let Err(error) = lease.defer_for_quiet_hours(&loaded.value) {
+                eprintln!("herdr-updater: {error}");
+                return 2;
+            }
+            if !args.json {
+                println!("scheduled check deferred during quiet hours");
+            }
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("herdr-updater: {error}");
+            return 2;
+        }
+        Ok(false) => {}
+    }
+
+    let check_code = if loaded.value.policy == config::Policy::Auto {
+        apply_report(args, loaded, false)
+    } else {
+        check_or_plan(args, loaded)
+    };
+    let mut fleet_synced = false;
+    let mut final_code = check_code;
+    if lease.fleet_sync_due(&loaded.value) {
+        let sync_code = sync::cmd_sync(
+            sync::CommandRequest {
+                mode: "apply",
+                hosts: &args.hosts,
+                json: args.json,
+                yes: false,
+            },
+            config_dir,
+            &loaded.value,
+            &herdr_bin(),
+            args.timeout,
+        );
+        fleet_synced = sync_code == 0;
+        final_code = final_code.max(sync_code);
+    }
+    let successful = if loaded.value.policy == config::Policy::Notify {
+        final_code <= 1
+    } else {
+        final_code == 0
+    };
+    if let Err(error) = lease.finish(&loaded.value, final_code, successful, fleet_synced) {
+        eprintln!("herdr-updater: {error}");
+        return 2;
+    }
+    final_code
+}
+
 fn run(args: &mut Args) -> i32 {
     if args.command == "version" {
         println!("herdr-updater {}", env!("CARGO_PKG_VERSION"));
@@ -621,14 +792,96 @@ fn run(args: &mut Args) -> i32 {
     if args.allow_protocol_change {
         loaded.value.allow_protocol_change = true;
     }
+    let config_dir = loaded
+        .path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     match args.command.as_str() {
         "check" | "plan" => check_or_plan(args, &loaded),
         "apply" | "update" => apply_report(args, &loaded, false),
         "startup" if !loaded.value.startup_check => 0,
-        "startup" => apply_report(args, &loaded, true),
+        "startup" => startup_run(args, &loaded),
         "history" => print_history(args, &loaded),
         "rollback" => rollback_or_resume(args, &loaded, false),
         "resume" => rollback_or_resume(args, &loaded, true),
+        "search" => {
+            let query = args.operands.join(" ");
+            catalog::cmd_search(
+                catalog::SearchRequest {
+                    query: &query,
+                    json: args.json,
+                    sort: args.sort,
+                    limit: args.limit,
+                    refresh: args.refresh,
+                },
+                config_dir,
+                &loaded.value,
+                args.timeout,
+            )
+        }
+        "install" if args.operands.len() == 1 => catalog::cmd_install(
+            &args.operands[0],
+            args.yes,
+            args.refresh,
+            config_dir,
+            &loaded.value,
+            &bin,
+            args.timeout,
+        ),
+        "install" => {
+            eprintln!("herdr-updater: install needs exactly one plugin id or source");
+            3
+        }
+        "store" => catalog::cmd_store(config_dir, &loaded.value, &bin, args.timeout),
+        "open-store" => catalog::open_store(&bin, args.timeout),
+        "sync" => {
+            let mode = args.operands.first().map(String::as_str).unwrap_or("plan");
+            if args.operands.len() > 1 {
+                eprintln!("herdr-updater: sync accepts one mode: plan, apply, or export");
+                3
+            } else {
+                sync::cmd_sync(
+                    sync::CommandRequest {
+                        mode,
+                        hosts: &args.hosts,
+                        json: args.json,
+                        yes: args.yes,
+                    },
+                    config_dir,
+                    &loaded.value,
+                    &bin,
+                    args.timeout,
+                )
+            }
+        }
+        "schedule" => {
+            let mode = args
+                .operands
+                .first()
+                .map(String::as_str)
+                .unwrap_or("status");
+            if args.operands.len() > 1 {
+                eprintln!(
+                    "herdr-updater: schedule accepts one mode: run, install, status, or remove"
+                );
+                3
+            } else if mode == "run" {
+                scheduled_run(args, &loaded)
+            } else {
+                schedule::cmd_schedule(
+                    mode,
+                    config_dir,
+                    &loaded.path,
+                    &loaded.value,
+                    args.json,
+                    args.timeout,
+                )
+            }
+        }
+        "config-fingerprint" => {
+            println!("{}", config::fingerprint(&loaded.value));
+            0
+        }
         other => {
             eprintln!("herdr-updater: unknown command: {other}\n");
             eprint!("{USAGE}");

@@ -18,29 +18,31 @@ struct PluginListResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct InstalledPlugin {
-    plugin_id: String,
+pub(crate) struct InstalledPlugin {
+    pub plugin_id: String,
     #[serde(default)]
-    version: Option<String>,
+    pub version: Option<String>,
     #[serde(default)]
-    plugin_root: Option<String>,
+    pub plugin_root: Option<String>,
     #[serde(default)]
-    source: Option<PluginSource>,
+    pub source: Option<PluginSource>,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PluginSource {
-    kind: String,
+pub(crate) struct PluginSource {
+    pub kind: String,
     #[serde(default)]
-    owner: Option<String>,
+    pub owner: Option<String>,
     #[serde(default)]
-    repo: Option<String>,
+    pub repo: Option<String>,
     #[serde(default)]
-    subdir: Option<String>,
+    pub subdir: Option<String>,
     #[serde(default)]
-    requested_ref: Option<String>,
+    pub requested_ref: Option<String>,
     #[serde(default)]
-    resolved_commit: Option<String>,
+    pub resolved_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -92,7 +94,7 @@ pub enum Decision {
     Error(String),
 }
 
-fn valid_segment(value: &str, max: usize) -> bool {
+pub(crate) fn valid_segment(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
@@ -102,7 +104,7 @@ fn valid_segment(value: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-fn valid_subdir(value: &str) -> bool {
+pub(crate) fn valid_subdir(value: &str) -> bool {
     value.len() <= 240
         && !value.starts_with(['/', '\\'])
         && value
@@ -110,11 +112,11 @@ fn valid_subdir(value: &str) -> bool {
             .all(|part| valid_segment(part, 100))
 }
 
-fn full_commit(value: &str) -> bool {
+pub(crate) fn full_commit(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn valid_ref(value: &str) -> bool {
+pub(crate) fn valid_ref(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200
         && !matches!(value.as_bytes().first(), Some(b'-' | b'/' | b'.'))
@@ -129,7 +131,10 @@ fn valid_ref(value: &str) -> bool {
         })
 }
 
-fn list_installed(herdr_bin: &str, timeout: Duration) -> Result<Vec<InstalledPlugin>, String> {
+pub(crate) fn list_installed(
+    herdr_bin: &str,
+    timeout: Duration,
+) -> Result<Vec<InstalledPlugin>, String> {
     let out = exec::run(herdr_bin, &["plugin", "list", "--json"], timeout)
         .map_err(|e| format!("herdr plugin list: {e}"))?;
     if !out.ok() {
@@ -437,20 +442,66 @@ pub fn install(
         source.push('/');
         source.push_str(subdir);
     }
-    let mut owned = vec!["plugin".to_string(), "install".to_string(), source];
+    install_source(herdr_bin, &source, reference, true, timeout)
+}
+
+pub fn install_source(
+    herdr_bin: &str,
+    source: &str,
+    reference: Option<&str>,
+    yes: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    validate_source(source)?;
+    if reference.is_some_and(|value| !valid_ref(value)) {
+        return Err("plugin reference contains unsupported characters".into());
+    }
+    let mut owned = vec![
+        "plugin".to_string(),
+        "install".to_string(),
+        source.to_string(),
+    ];
     if let Some(reference) = reference.filter(|value| !value.is_empty()) {
         owned.push("--ref".into());
         owned.push(reference.into());
     }
-    owned.push("--yes".into());
+    if yes {
+        owned.push("--yes".into());
+    }
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let out = exec::run(herdr_bin, &args, timeout).map_err(|e| format!("plugin install: {e}"))?;
-    if !out.ok() {
-        return Err(format!(
-            "plugin install exited {}: {}",
-            out.code,
-            out.stderr.lines().next().unwrap_or("no stderr")
-        ));
+    if yes {
+        let out =
+            exec::run(herdr_bin, &args, timeout).map_err(|e| format!("plugin install: {e}"))?;
+        if !out.ok() {
+            return Err(format!(
+                "plugin install exited {}: {}",
+                out.code,
+                out.stderr.lines().next().unwrap_or("no stderr")
+            ));
+        }
+    } else {
+        let code =
+            exec::run_inherited(herdr_bin, &args).map_err(|e| format!("plugin install: {e}"))?;
+        if code != 0 {
+            return Err(format!("plugin install exited {code}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_source(source: &str) -> Result<(), String> {
+    if source.len() > 340 || source.starts_with(['/', '\\']) {
+        return Err("plugin source is invalid".into());
+    }
+    let mut parts = source.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if !valid_segment(owner, 100) || !valid_segment(repo, 100) {
+        return Err("plugin source must be owner/repo[/subdir]".into());
+    }
+    let rest = parts.collect::<Vec<_>>().join("/");
+    if !rest.is_empty() && !valid_subdir(&rest) {
+        return Err("plugin source subdirectory is invalid".into());
     }
     Ok(())
 }

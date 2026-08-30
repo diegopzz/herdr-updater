@@ -50,6 +50,7 @@ fi
         .env("TEST_STATUS", status)
         .env("TEST_LATEST", latest)
         .env("TEST_CONFIG_DIR", &config)
+        .env("HOME", &root)
         .env("PATH", path)
         .output()
         .unwrap();
@@ -95,6 +96,44 @@ fn malformed_status_is_unknown_not_current() {
 fn bad_command_is_usage_error() {
     let output = run(
         &["bogus"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+    );
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn schedule_status_is_read_only_and_succeeds_without_an_installed_timer() {
+    let output = run(
+        &["schedule", "status", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["installed"], false);
+}
+
+#[test]
+fn sync_plan_without_connected_hosts_is_incomplete_not_green() {
+    let output = run(
+        &["sync", "plan", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("no fleet hosts")))));
+}
+
+#[test]
+fn invalid_marketplace_sort_is_a_usage_error() {
+    let output = run(
+        &["search", "viewer", "--sort", "mystery"],
         CURRENT_STATUS,
         r#"{"version":"0.8.2","protocol":20}"#,
     );

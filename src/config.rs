@@ -20,6 +20,14 @@ pub struct Config {
     pub check_core: bool,
     pub check_plugins: bool,
     pub startup_check: bool,
+    pub check_interval: String,
+    pub catalog_refresh_interval: String,
+    pub fleet_sync_interval: String,
+    pub initial_delay: String,
+    pub jitter: String,
+    pub quiet_hours: Option<String>,
+    pub scheduled_fleet_sync: bool,
+    pub sync_update_settings: bool,
     pub require_fast_forward: bool,
     pub immutable_pins: bool,
     pub allow_protocol_change: bool,
@@ -35,6 +43,14 @@ impl Default for Config {
             check_core: true,
             check_plugins: true,
             startup_check: true,
+            check_interval: "6h".into(),
+            catalog_refresh_interval: "30m".into(),
+            fleet_sync_interval: "6h".into(),
+            initial_delay: "5m".into(),
+            jitter: "5m".into(),
+            quiet_hours: None,
+            scheduled_fleet_sync: false,
+            sync_update_settings: false,
             require_fast_forward: true,
             immutable_pins: true,
             allow_protocol_change: false,
@@ -110,13 +126,8 @@ pub fn load(
     };
     let mut value: Config =
         toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-    if !value.require_fast_forward {
-        return Err(format!(
-            "{} attempts to disable fast-forward-only enforcement",
-            path.display()
-        ));
-    }
     value.max_concurrency = value.max_concurrency.clamp(1, 32);
+    validate_value(&value, &path)?;
     Ok(Loaded {
         value,
         path,
@@ -125,6 +136,27 @@ pub fn load(
 }
 
 impl Config {
+    pub fn check_every(&self) -> Duration {
+        parse_duration(&self.check_interval).unwrap_or(Duration::from_secs(6 * 60 * 60))
+    }
+
+    pub fn catalog_refresh_every(&self) -> Duration {
+        parse_duration(&self.catalog_refresh_interval).unwrap_or(Duration::from_secs(30 * 60))
+    }
+
+    pub fn fleet_sync_every(&self) -> Duration {
+        parse_duration(&self.fleet_sync_interval).unwrap_or(Duration::from_secs(6 * 60 * 60))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn initial_delay_value(&self) -> Duration {
+        parse_duration(&self.initial_delay).unwrap_or(Duration::from_secs(5 * 60))
+    }
+
+    pub fn jitter_value(&self) -> Duration {
+        parse_duration(&self.jitter).unwrap_or(Duration::from_secs(5 * 60))
+    }
+
     pub fn target_allowed(&self, owner: &str, repo: &str) -> bool {
         if !self.trusted_owners.is_empty()
             && !self
@@ -140,6 +172,152 @@ impl Config {
         let target = format!("{owner}/{repo}");
         self.allow.iter().any(|pattern| wildcard(pattern, &target))
     }
+}
+
+pub fn parse_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration is empty".into());
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut total = 0u64;
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if start == index || index == bytes.len() {
+            return Err(format!(
+                "invalid duration {value:?}; use values such as 30m, 6h, or 1d"
+            ));
+        }
+        let amount: u64 = value[start..index]
+            .parse()
+            .map_err(|_| format!("duration component is too large in {value:?}"))?;
+        let multiplier = match bytes[index].to_ascii_lowercase() {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 60 * 60,
+            b'd' => 24 * 60 * 60,
+            _ => {
+                return Err(format!(
+                    "invalid duration unit in {value:?}; supported units are s, m, h, and d"
+                ))
+            }
+        };
+        total = total
+            .checked_add(
+                amount
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| format!("duration component is too large in {value:?}"))?,
+            )
+            .ok_or_else(|| format!("duration is too large in {value:?}"))?;
+        index += 1;
+    }
+    Ok(Duration::from_secs(total))
+}
+
+pub(crate) fn validate_value(value: &Config, path: &Path) -> Result<(), String> {
+    if !value.require_fast_forward {
+        return Err(format!(
+            "{} attempts to disable fast-forward-only enforcement",
+            path.display()
+        ));
+    }
+    validate_durations(value, path)
+}
+
+fn validate_durations(value: &Config, path: &Path) -> Result<(), String> {
+    let check = bounded_duration(
+        &value.check_interval,
+        60,
+        30 * 24 * 60 * 60,
+        "check_interval",
+        path,
+    )?;
+    bounded_duration(
+        &value.catalog_refresh_interval,
+        5 * 60,
+        7 * 24 * 60 * 60,
+        "catalog_refresh_interval",
+        path,
+    )?;
+    bounded_duration(
+        &value.fleet_sync_interval,
+        5 * 60,
+        30 * 24 * 60 * 60,
+        "fleet_sync_interval",
+        path,
+    )?;
+    bounded_duration(
+        &value.initial_delay,
+        0,
+        7 * 24 * 60 * 60,
+        "initial_delay",
+        path,
+    )?;
+    let jitter = bounded_duration(&value.jitter, 0, 24 * 60 * 60, "jitter", path)?;
+    if jitter > check {
+        return Err(format!(
+            "{}: jitter cannot exceed check_interval",
+            path.display()
+        ));
+    }
+    if let Some(hours) = value.quiet_hours.as_deref() {
+        parse_quiet_hours(hours).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn fingerprint(value: &Config) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn bounded_duration(
+    raw: &str,
+    minimum: u64,
+    maximum: u64,
+    field: &str,
+    path: &Path,
+) -> Result<Duration, String> {
+    let parsed =
+        parse_duration(raw).map_err(|error| format!("{}: {field}: {error}", path.display()))?;
+    if parsed.as_secs() < minimum || parsed.as_secs() > maximum {
+        return Err(format!(
+            "{}: {field} must be between {minimum}s and {maximum}s",
+            path.display()
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn parse_quiet_hours(value: &str) -> Result<(u16, u16), String> {
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| "quiet_hours must use HH:MM-HH:MM".to_string())?;
+    fn minutes(raw: &str) -> Option<u16> {
+        let (hour, minute) = raw.split_once(':')?;
+        if hour.len() != 2 || minute.len() != 2 {
+            return None;
+        }
+        let hour: u16 = hour.parse().ok()?;
+        let minute: u16 = minute.parse().ok()?;
+        (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+    }
+    let start =
+        minutes(start).ok_or_else(|| "quiet_hours has an invalid start time".to_string())?;
+    let end = minutes(end).ok_or_else(|| "quiet_hours has an invalid end time".to_string())?;
+    if start == end {
+        return Err("quiet_hours cannot cover the entire day".into());
+    }
+    Ok((start, end))
 }
 
 fn wildcard(pattern: &str, value: &str) -> bool {
@@ -214,5 +392,32 @@ mod tests {
         let result = load(Some(&path), "herdr", Duration::from_secs(1));
         let _ = std::fs::remove_file(path);
         assert!(matches!(result, Err(error) if error.contains("fast-forward-only")));
+    }
+
+    #[test]
+    fn durations_support_compound_values_and_require_units() {
+        assert_eq!(parse_duration("1h30m").unwrap().as_secs(), 5_400);
+        assert_eq!(parse_duration("2d3h4m5s").unwrap().as_secs(), 183_845);
+        assert!(parse_duration("30").is_err());
+        assert!(parse_duration("1h 30m").is_err());
+    }
+
+    #[test]
+    fn quiet_hours_validate_clock_ranges() {
+        assert_eq!(parse_quiet_hours("22:00-07:30").unwrap(), (1_320, 450));
+        assert!(parse_quiet_hours("24:00-07:30").is_err());
+        assert!(parse_quiet_hours("07:30-07:30").is_err());
+    }
+
+    #[test]
+    fn jitter_cannot_exceed_the_check_interval() {
+        let value = Config {
+            check_interval: "10m".into(),
+            jitter: "11m".into(),
+            ..Config::default()
+        };
+        assert!(validate_value(&value, Path::new("config.toml"))
+            .unwrap_err()
+            .contains("jitter cannot exceed"));
     }
 }

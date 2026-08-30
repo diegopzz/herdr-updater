@@ -13,6 +13,8 @@ pub enum EventKind {
     PluginRolledBack,
     PluginResumed,
     CoreUpdated,
+    FleetPluginSynced,
+    FleetConfigSynced,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -5,6 +5,21 @@ check_core = true
 check_plugins = true
 startup_check = true
 
+# Human durations support s, m, h, d, and combinations such as 1h30m.
+check_interval = "6h"
+catalog_refresh_interval = "30m"
+fleet_sync_interval = "6h"
+initial_delay = "5m"
+jitter = "5m"
+
+# Optional local-time quiet window. Overnight windows are supported.
+# quiet_hours = "22:00-07:00"
+
+# Scheduled fleet reconciliation is opt-in. Syncing the non-secret updater
+# settings is a separate opt-in because remote hosts may need local policy.
+scheduled_fleet_sync = false
+sync_update_settings = false
+
 # Only an installed commit that is behind its upstream branch may update.
 require_fast_forward = true
 immutable_pins = true

@@ -59,6 +59,11 @@ pub struct FleetPlugin {
     pub version: Option<String>,
     pub source: String,
     pub revision: Option<String>,
+    pub owner: Option<String>,
+    pub repo: Option<String>,
+    pub subdir: Option<String>,
+    pub requested_ref: Option<String>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +83,8 @@ struct FleetPluginJson {
     version: Option<String>,
     #[serde(default)]
     source: Option<FleetSourceJson>,
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +92,14 @@ struct FleetSourceJson {
     kind: String,
     #[serde(default)]
     resolved_commit: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+    #[serde(default)]
+    requested_ref: Option<String>,
 }
 
 fn parse_plugins(text: &str) -> Result<BTreeMap<String, FleetPlugin>, String> {
@@ -100,13 +115,33 @@ fn parse_plugins(text: &str) -> Result<BTreeMap<String, FleetPlugin>, String> {
                 .as_ref()
                 .map(|s| s.kind.clone())
                 .unwrap_or_default();
-            let revision = plugin.source.and_then(|s| s.resolved_commit);
+            let revision = plugin
+                .source
+                .as_ref()
+                .and_then(|s| s.resolved_commit.clone());
             (
                 plugin.plugin_id,
                 FleetPlugin {
                     version: plugin.version,
                     source,
                     revision,
+                    owner: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.owner.clone()),
+                    repo: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.repo.clone()),
+                    subdir: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.subdir.clone()),
+                    requested_ref: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.requested_ref.clone()),
+                    enabled: plugin.enabled,
                 },
             )
         })
@@ -117,7 +152,7 @@ fn parse_plugins(text: &str) -> Result<BTreeMap<String, FleetPlugin>, String> {
 /// config file rather than the network, but "config file" is not "trusted
 /// input" — reject anything that is not plainly a host alias so a stray value
 /// can never grow into an option or a second argument.
-fn valid_alias(s: &str) -> bool {
+pub(crate) fn valid_alias(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s.len() <= 128
@@ -134,7 +169,7 @@ fn home() -> Option<PathBuf> {
 /// Load the fleet definition, returning the file we actually read so the
 /// report can say which config won. "Which config won?" should never be a
 /// guess — that ambiguity is its own class of bug.
-fn load_hosts() -> (Vec<(String, String)>, Option<PathBuf>) {
+pub(crate) fn load_hosts() -> (Vec<(String, String)>, Option<PathBuf>) {
     let Some(home) = home() else {
         return (vec![], None);
     };
@@ -166,7 +201,7 @@ fn load_hosts() -> (Vec<(String, String)>, Option<PathBuf>) {
 /// frequently has neither `~/.local/bin` on PATH nor a profile that adds it.
 /// Getting this wrong is exactly the failure that makes a healthy host look
 /// like it has no herdr at all.
-fn probe_remote(target: &str, timeout: Duration) -> HostState {
+pub(crate) fn probe_remote(target: &str, timeout: Duration) -> HostState {
     let mut st = HostState {
         host: target.to_string(),
         target: target.to_string(),
@@ -233,7 +268,7 @@ fn probe_remote(target: &str, timeout: Duration) -> HostState {
     st
 }
 
-fn probe_local(timeout: Duration) -> HostState {
+pub(crate) fn probe_local(timeout: Duration) -> HostState {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
     let mut st = HostState {
         host: "this machine".into(),
@@ -284,6 +319,15 @@ const SPLIT_WARNING: &str = "  \u{26a0} PROTOCOL SPLIT — hosts are on differen
     Update before relying on --remote, and close the drift regardless.";
 
 pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
+    let (states, source) = collect_states(only, timeout);
+
+    render_fleet(states, source, json)
+}
+
+pub(crate) fn collect_states(
+    only: &[String],
+    timeout: Duration,
+) -> (Vec<HostState>, Option<PathBuf>) {
     let (mut hosts, source) = load_hosts();
     if !only.is_empty() {
         hosts.retain(|(name, target)| only.contains(name) || only.contains(target));
@@ -309,7 +353,10 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
     drop(tx);
     states.extend(rx);
     states.sort_by(|a, b| b.local.cmp(&a.local).then(a.host.cmp(&b.host)));
+    (states, source)
+}
 
+fn render_fleet(states: Vec<HostState>, source: Option<PathBuf>, json: bool) -> i32 {
     // Drift is computed only over hosts we could actually read. An unreachable
     // host is reported as unknown, never quietly folded into "the fleet
     // agrees" — that is the exact failure this tool exists to prevent.
@@ -488,6 +535,7 @@ always_control = true
         let text = r#"{"result":{"plugins":[{"plugin_id":"mirror","version":"0.3.1","source":{"kind":"local"}},{"plugin_id":"files","source":{"kind":"github","resolved_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}"#;
         let plugins = parse_plugins(text).unwrap();
         assert_eq!(plugins["mirror"].source, "local");
+        assert!(!plugins["mirror"].enabled);
         assert_eq!(
             plugins["files"].revision.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
