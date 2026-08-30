@@ -278,10 +278,19 @@ pub fn plan(
         warnings.push("no fleet hosts file was found".into());
     }
     warnings.extend(unmatched_host_warnings(hosts, &states));
-    let local_protocol = states
-        .iter()
-        .find(|state| state.local)
-        .and_then(|state| state.protocol);
+    let local_protocol = match require_source_protocol(&states) {
+        Ok(protocol) => protocol,
+        Err(mut decisions) => {
+            decisions.sort_by(|a, b| a.host.cmp(&b.host).then(a.plugin_id.cmp(&b.plugin_id)));
+            return Ok(SyncReport {
+                desired_path: desired_path(config_dir).display().to_string(),
+                desired_exists,
+                generated_unix_seconds: desired.generated_unix_seconds,
+                decisions,
+                warnings,
+            });
+        }
+    };
     let mut decisions = Vec::new();
     for state in states.into_iter().filter(|state| !state.local) {
         if let Some(error) = &state.error {
@@ -300,14 +309,14 @@ pub fn plan(
             decisions.push(decision);
             continue;
         }
-        if local_protocol.is_some() && state.protocol != local_protocol {
+        if state.protocol != Some(local_protocol) {
             decisions.push(SyncDecision {
                 host: state.host,
                 target: state.target,
                 plugin_id: "*".into(),
                 source: None,
                 previous: state.protocol.map(|value| value.to_string()),
-                desired: local_protocol.map(|value| value.to_string()),
+                desired: Some(local_protocol.to_string()),
                 action: SyncAction::Hold("protocol differs from the source host".into()),
             });
             continue;
@@ -339,6 +348,47 @@ pub fn plan(
         decisions,
         warnings,
     })
+}
+
+fn require_source_protocol(states: &[HostState]) -> Result<u32, Vec<SyncDecision>> {
+    let local = states.iter().find(|state| state.local);
+    let reason = match local {
+        Some(state) if state.error.is_some() => format!(
+            "source host Herdr state is unknown: {}",
+            state.error.as_deref().unwrap_or("unknown status error")
+        ),
+        Some(state) if state.protocol.is_none() => {
+            "source host Herdr protocol is unknown".to_string()
+        }
+        Some(state) => return Ok(state.protocol.expect("protocol checked above")),
+        None => "source host Herdr state is missing".to_string(),
+    };
+
+    let mut decisions = Vec::new();
+    decisions.push(SyncDecision {
+        host: local.map_or_else(|| "local".into(), |state| state.host.clone()),
+        target: local.map_or_else(|| "local".into(), |state| state.target.clone()),
+        plugin_id: "*".into(),
+        source: None,
+        previous: None,
+        desired: None,
+        action: SyncAction::Offline(reason.clone()),
+    });
+    decisions.extend(
+        states
+            .iter()
+            .filter(|state| !state.local)
+            .map(|state| SyncDecision {
+                host: state.host.clone(),
+                target: state.target.clone(),
+                plugin_id: "*".into(),
+                source: None,
+                previous: state.protocol.map(|value| value.to_string()),
+                desired: None,
+                action: SyncAction::Hold(format!("{reason}; refusing to change the remote host")),
+            }),
+    );
+    Err(decisions)
 }
 
 fn plugin_inventory_hold(state: &HostState) -> Option<SyncDecision> {
@@ -1005,5 +1055,39 @@ mod tests {
         };
         let decision = plugin_inventory_hold(&state).expect("inventory failure must hold");
         assert!(matches!(decision.action, SyncAction::Hold(_)));
+    }
+
+    #[test]
+    fn unknown_source_protocol_holds_every_remote_change() {
+        let local = HostState {
+            host: "local".into(),
+            target: "local".into(),
+            local: true,
+            version: None,
+            protocol: None,
+            server_running: false,
+            plugins: BTreeMap::new(),
+            plugin_error: None,
+            error: Some("malformed Herdr status".into()),
+        };
+        let remote = host(None);
+
+        let decisions = require_source_protocol(&[local, remote])
+            .expect_err("unknown source state must stop fleet planning");
+
+        assert!(decisions
+            .iter()
+            .any(|decision| matches!(decision.action, SyncAction::Offline(_))));
+        assert!(decisions
+            .iter()
+            .any(|decision| matches!(decision.action, SyncAction::Hold(_))));
+        assert!(!decisions.iter().any(|decision| matches!(
+            decision.action,
+            SyncAction::Install
+                | SyncAction::Update
+                | SyncAction::Enable
+                | SyncAction::Disable
+                | SyncAction::SyncSettings
+        )));
     }
 }

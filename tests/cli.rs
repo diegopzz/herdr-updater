@@ -147,6 +147,25 @@ fn sync_plan_reports_an_unmatched_host_selection() {
 }
 
 #[test]
+fn sync_plan_with_unknown_local_protocol_fails_closed() {
+    let output = run(
+        &["sync", "plan", "--json"],
+        "not-json",
+        r#"{"version":"0.8.2","protocol":20}"#,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let decisions = json["decisions"].as_array().expect("sync decisions");
+    assert!(decisions
+        .iter()
+        .any(|decision| decision["action"]["action"] == "offline"));
+    assert!(!decisions.iter().any(|decision| matches!(
+        decision["action"]["action"].as_str(),
+        Some("install" | "update" | "enable" | "disable" | "sync_settings")
+    )));
+}
+
+#[test]
 fn invalid_marketplace_sort_is_a_usage_error() {
     let output = run(
         &["search", "viewer", "--sort", "mystery"],
