@@ -201,10 +201,14 @@ mod tests {
 
     #[test]
     fn config_cannot_disable_fast_forward_enforcement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "herdr-updater-config-{}-{}.toml",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            unique
         ));
         std::fs::write(&path, "require_fast_forward = false\n").unwrap();
         let result = load(Some(&path), "herdr", Duration::from_secs(1));
