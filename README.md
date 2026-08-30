@@ -150,9 +150,14 @@ sync_update_settings = false
 
 `schedule install` creates a user-scoped systemd timer on Linux, launchd agent
 on macOS, or Task Scheduler task on Windows. The internal state prevents double
-runs, honors quiet hours, adds bounded jitter, and uses capped retry backoff.
+runs, applies the initial delay on every platform, honors quiet hours, adds
+bounded jitter, and uses capped retry backoff. A bounded scheduler heartbeat
+observes the state deadline without stretching a jittered interval toward the
+next full interval.
 Installing or removing a schedule is always explicit; installing the plugin
-does not silently create an operating-system task.
+does not silently create an operating-system task. Rerun `schedule install`
+after changing timing settings so the native scheduler receives the new
+heartbeat.
 
 ## Plugin store inside Herdr
 

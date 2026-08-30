@@ -148,7 +148,6 @@ impl Config {
         parse_duration(&self.fleet_sync_interval).unwrap_or(Duration::from_secs(6 * 60 * 60))
     }
 
-    #[cfg(target_os = "linux")]
     pub fn initial_delay_value(&self) -> Duration {
         parse_duration(&self.initial_delay).unwrap_or(Duration::from_secs(5 * 60))
     }

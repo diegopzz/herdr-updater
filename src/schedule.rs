@@ -10,6 +10,7 @@ use crate::exec;
 const STATE_FILE: &str = "schedule-state.json";
 const LOCK_DIR: &str = "schedule.lock";
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_SCHEDULER_TICK: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ScheduleState {
@@ -33,6 +34,24 @@ pub struct RunLease {
     lock: PathBuf,
     state_path: PathBuf,
     state: ScheduleState,
+}
+
+struct StateBackup {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    changed: bool,
+}
+
+impl StateBackup {
+    fn restore(self) -> Result<(), String> {
+        if !self.changed {
+            return Ok(());
+        }
+        match self.original {
+            Some(bytes) => write_owned(&self.path, &bytes),
+            None => remove_owned(&self.path),
+        }
+    }
 }
 
 impl Drop for RunLease {
@@ -155,7 +174,7 @@ pub fn cmd_schedule(
     timeout: Duration,
 ) -> i32 {
     let result = match mode {
-        "install" => install(config_dir, config_path, config, timeout),
+        "install" => install_with_initial_state(config_dir, config_path, config, timeout),
         "remove" => remove(config_dir, timeout),
         "status" => status(config_dir),
         _ => Err("schedule mode must be run, install, status, or remove".into()),
@@ -201,6 +220,24 @@ pub fn cmd_schedule(
     }
 }
 
+fn install_with_initial_state(
+    config_dir: &Path,
+    config_path: &Path,
+    config: &Config,
+    timeout: Duration,
+) -> Result<Status, String> {
+    let backup = prepare_initial_state(config_dir, config)?;
+    match install(config_dir, config_path, config, timeout) {
+        Ok(status) => Ok(status),
+        Err(error) => match backup.restore() {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!(
+                "{error}; additionally could not restore schedule state: {restore_error}"
+            )),
+        },
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn install(
     config_dir: &Path,
@@ -216,16 +253,20 @@ fn install(
     let service = unit_dir.join("herdr-updater.service");
     let timer = unit_dir.join("herdr-updater.timer");
     let executable = current_exe()?;
+    let tick = scheduler_tick(config);
     let service_text = format!(
         "[Unit]\nDescription=Check Herdr core and plugins\n\n[Service]\nType=oneshot\nSuccessExitStatus=1\nExecStart={} schedule run --config {}\n",
         systemd_quote(&executable),
         systemd_quote(config_path)
     );
     let timer_text = format!(
-        "[Unit]\nDescription=Schedule Herdr update checks\n\n[Timer]\nOnBootSec={}\nOnUnitActiveSec={}\nRandomizedDelaySec={}\nPersistent=true\nUnit=herdr-updater.service\n\n[Install]\nWantedBy=timers.target\n",
-        config.initial_delay_value().as_secs(),
-        config.check_every().as_secs(),
-        config.jitter_value().as_secs()
+        "[Unit]\nDescription=Schedule Herdr update checks\n\n[Timer]\nOnBootSec={}\nOnUnitActiveSec={}\nPersistent=true\nUnit=herdr-updater.service\n\n[Install]\nWantedBy=timers.target\n",
+        if config.initial_delay_value().is_zero() {
+            1
+        } else {
+            tick.as_secs()
+        },
+        tick.as_secs(),
     );
     write_owned(&service, service_text.as_bytes())?;
     write_owned(&timer, timer_text.as_bytes())?;
@@ -295,7 +336,7 @@ fn install(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>schedule</string><string>run</string><string>--config</string><string>{}</string></array>\n<key>StartInterval</key><integer>{}</integer>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
         xml_escape(&executable.display().to_string()),
         xml_escape(&config_path.display().to_string()),
-        config.check_every().as_secs()
+        scheduler_tick(config).as_secs()
     );
     write_owned(&resource, plist.as_bytes())?;
     let domain = launch_domain(timeout)?;
@@ -364,7 +405,7 @@ fn install(
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
         wrapper.display()
     );
-    let (schedule, modifier) = windows_frequency(config.check_every());
+    let (schedule, modifier) = windows_frequency(scheduler_tick(config));
     run_ok(
         "schtasks",
         &[
@@ -384,6 +425,14 @@ fn install(
         timeout,
         "Windows task creation",
     )?;
+    if config.initial_delay_value().is_zero() {
+        run_ok(
+            "schtasks",
+            &["/Run", "/TN", "Herdr Updater"],
+            timeout,
+            "Windows task start",
+        )?;
+    }
     status(config_dir)
 }
 
@@ -437,20 +486,63 @@ fn windows_frequency(interval: Duration) -> (&'static str, String) {
     }
 }
 
-fn read_state(path: &Path) -> Result<ScheduleState, String> {
+fn scheduler_tick(config: &Config) -> Duration {
+    let mut tick = config.check_every().min(MAX_SCHEDULER_TICK);
+    for candidate in [config.initial_delay_value(), config.jitter_value()] {
+        if !candidate.is_zero() {
+            tick = tick.min(candidate);
+        }
+    }
+    Duration::from_secs(tick.as_secs().max(1))
+}
+
+fn prepare_initial_state(config_dir: &Path, config: &Config) -> Result<StateBackup, String> {
+    let path = config_dir.join(STATE_FILE);
+    let original = read_optional_state_bytes(&path)?;
+    let mut state = match original.as_deref() {
+        Some(bytes) => serde_json::from_slice(bytes)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?,
+        None => ScheduleState::default(),
+    };
+    let changed = state.next_check_unix_seconds.is_none()
+        && state.last_attempt_unix_seconds.is_none()
+        && state.last_success_unix_seconds.is_none();
+    if changed {
+        let current = now();
+        state.next_check_unix_seconds = Some(
+            current
+                .saturating_add(config.initial_delay_value().as_secs())
+                .saturating_add(deterministic_jitter(current, config.jitter_value())),
+        );
+        persist_state(&path, &state)?;
+    }
+    Ok(StateBackup {
+        path,
+        original,
+        changed,
+    })
+}
+
+fn read_optional_state_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ScheduleState::default())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
     };
     if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
         return Err(format!("{} is not a bounded regular file", path.display()));
     }
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    serde_json::from_str(&text).map_err(|error| format!("cannot parse {}: {error}", path.display()))
+    fs::read(path)
+        .map(Some)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+}
+
+fn read_state(path: &Path) -> Result<ScheduleState, String> {
+    let Some(bytes) = read_optional_state_bytes(path)? else {
+        return Ok(ScheduleState::default());
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))
 }
 
 fn persist_state(path: &Path, state: &ScheduleState) -> Result<(), String> {
@@ -634,5 +726,38 @@ mod tests {
         for seed in 0..1_000 {
             assert!(deterministic_jitter(seed, Duration::from_secs(300)) <= 300);
         }
+    }
+
+    #[test]
+    fn scheduler_tick_is_short_enough_to_observe_jittered_deadlines() {
+        let config = Config::default();
+        assert_eq!(scheduler_tick(&config), Duration::from_secs(5 * 60));
+
+        let config = Config {
+            initial_delay: "0s".into(),
+            jitter: "90s".into(),
+            ..Config::default()
+        };
+        assert_eq!(scheduler_tick(&config), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn installing_a_schedule_seeds_and_can_restore_initial_state() {
+        let unique = format!("herdr-updater-schedule-{}-{}", std::process::id(), now());
+        let root = std::env::temp_dir().join(unique);
+        let config = Config {
+            initial_delay: "5m".into(),
+            jitter: "0s".into(),
+            ..Config::default()
+        };
+        let before = now();
+        let backup = prepare_initial_state(&root, &config).unwrap();
+        let state = read_state(&root.join(STATE_FILE)).unwrap();
+        assert!(state
+            .next_check_unix_seconds
+            .is_some_and(|next| { next >= before + 300 && next <= now().saturating_add(300) }));
+        backup.restore().unwrap();
+        assert!(!root.join(STATE_FILE).exists());
+        let _ = fs::remove_dir(root);
     }
 }

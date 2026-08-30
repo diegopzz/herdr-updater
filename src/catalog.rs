@@ -599,18 +599,20 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self, String> {
         terminal::enable_raw_mode().map_err(|error| format!("cannot enter raw mode: {error}"))?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)
-            .map_err(|error| format!("cannot open store screen: {error}"))?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+            let _ = terminal::disable_raw_mode();
+            return Err(format!("cannot open store screen: {error}"));
+        }
         Ok(Self { active: true })
     }
 
     fn leave(&mut self) -> Result<(), String> {
         if self.active {
-            execute!(io::stdout(), Show, LeaveAlternateScreen)
-                .map_err(|error| format!("cannot close store screen: {error}"))?;
-            terminal::disable_raw_mode()
-                .map_err(|error| format!("cannot leave raw mode: {error}"))?;
+            let screen_result = execute!(io::stdout(), Show, LeaveAlternateScreen);
+            let raw_result = terminal::disable_raw_mode();
             self.active = false;
+            screen_result.map_err(|error| format!("cannot close store screen: {error}"))?;
+            raw_result.map_err(|error| format!("cannot leave raw mode: {error}"))?;
         }
         Ok(())
     }
@@ -619,8 +621,10 @@ impl TerminalGuard {
         if !self.active {
             terminal::enable_raw_mode()
                 .map_err(|error| format!("cannot re-enter raw mode: {error}"))?;
-            execute!(io::stdout(), EnterAlternateScreen, Hide)
-                .map_err(|error| format!("cannot restore store screen: {error}"))?;
+            if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+                let _ = terminal::disable_raw_mode();
+                return Err(format!("cannot restore store screen: {error}"));
+            }
             self.active = true;
         }
         Ok(())

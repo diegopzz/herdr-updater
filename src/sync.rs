@@ -264,12 +264,16 @@ pub fn plan(
     hosts: &[String],
     timeout: Duration,
 ) -> Result<SyncReport, String> {
+    if let Some(host) = hosts.iter().find(|host| !fleet::valid_alias(host)) {
+        return Err(format!("requested fleet host is invalid: {host:?}"));
+    }
     let (desired, desired_exists, mut warnings) =
         load_or_derive(config_dir, config, herdr_bin, timeout)?;
     let (states, host_source) = fleet::collect_states(hosts, timeout);
     if host_source.is_none() {
         warnings.push("no fleet hosts file was found".into());
     }
+    warnings.extend(unmatched_host_warnings(hosts, &states));
     let local_protocol = states
         .iter()
         .find(|state| state.local)
@@ -286,6 +290,10 @@ pub fn plan(
                 desired: None,
                 action: SyncAction::Offline(error.clone()),
             });
+            continue;
+        }
+        if let Some(decision) = plugin_inventory_hold(&state) {
+            decisions.push(decision);
             continue;
         }
         if local_protocol.is_some() && state.protocol != local_protocol {
@@ -327,6 +335,30 @@ pub fn plan(
         decisions,
         warnings,
     })
+}
+
+fn plugin_inventory_hold(state: &HostState) -> Option<SyncDecision> {
+    state.plugin_error.as_ref().map(|error| SyncDecision {
+        host: state.host.clone(),
+        target: state.target.clone(),
+        plugin_id: "*".into(),
+        source: None,
+        previous: None,
+        desired: None,
+        action: SyncAction::Hold(format!("plugin inventory is unknown: {error}")),
+    })
+}
+
+fn unmatched_host_warnings(requested: &[String], states: &[HostState]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|requested| {
+            !states.iter().any(|state| {
+                !state.local && (&state.host == *requested || &state.target == *requested)
+            })
+        })
+        .map(|host| format!("requested host {host} is not present in the fleet configuration"))
+        .collect()
 }
 
 fn plan_host(state: &HostState, desired: &DesiredState) -> Vec<SyncDecision> {
@@ -881,5 +913,22 @@ mod tests {
             warnings: vec!["no connected hosts".into()],
         };
         assert_eq!(report_code(&report), 1);
+    }
+
+    #[test]
+    fn unmatched_host_selections_are_reported() {
+        let warnings = unmatched_host_warnings(&["missing".into()], &[host(None)]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("missing"));
+    }
+
+    #[test]
+    fn unknown_plugin_inventory_is_held_before_planning() {
+        let state = HostState {
+            plugin_error: Some("malformed inventory".into()),
+            ..host(None)
+        };
+        let decision = plugin_inventory_hold(&state).expect("inventory failure must hold");
+        assert!(matches!(decision.action, SyncAction::Hold(_)));
     }
 }

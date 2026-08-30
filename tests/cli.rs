@@ -131,6 +131,22 @@ fn sync_plan_without_connected_hosts_is_incomplete_not_green() {
 }
 
 #[test]
+fn sync_plan_reports_an_unmatched_host_selection() {
+    let output = run(
+        &["sync", "plan", "--hosts", "missing-host", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("missing-host")))));
+}
+
+#[test]
 fn invalid_marketplace_sort_is_a_usage_error() {
     let output = run(
         &["search", "viewer", "--sort", "mystery"],
