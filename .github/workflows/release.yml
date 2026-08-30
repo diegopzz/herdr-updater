@@ -64,7 +64,7 @@ jobs:
           mkdir -p "$package"
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$package/${{ matrix.executable }}"
           tar -C "$package" -czf "herdr-updater-$version-${{ matrix.target }}.tar.gz" "${{ matrix.executable }}"
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ matrix.target }}
           path: herdr-updater-*.tar.gz
@@ -74,7 +74,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-*
           merge-multiple: true
