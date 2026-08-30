@@ -3,9 +3,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable release tag (vX.Y.Z)
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -18,7 +27,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: herdr-updater
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             executable: herdr-updater
           - os: macos-14
@@ -28,7 +37,20 @@ jobs:
             target: x86_64-pc-windows-msvc
             executable: herdr-updater.exe
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Validate immutable release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 2
+          fi
+          tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$tag_commit"
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
       - name: Build
@@ -37,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           package="$RUNNER_TEMP/package"
           mkdir -p "$package"
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "$package/${{ matrix.executable }}"
@@ -60,7 +82,7 @@ jobs:
       - name: Create checksums
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $version = $env:RELEASE_TAG.TrimStart('v')
           $lines = Get-ChildItem -LiteralPath dist -Filter 'herdr-updater-*.tar.gz' |
             Sort-Object Name |
             ForEach-Object { "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name }
@@ -71,4 +93,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $assets = Get-ChildItem -LiteralPath dist | Sort-Object Name | ForEach-Object FullName
-          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes --title $env:GITHUB_REF_NAME @assets
+          gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes --title $env:RELEASE_TAG @assets
