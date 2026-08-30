@@ -5,7 +5,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $DevBinary = Join-Path $Root "target\release\herdr-updater.exe"
-$CachedBinary = Join-Path $Root "bin\.cache\0.1.0\herdr-updater.exe"
+$CachedBinary = Join-Path $Root "bin\.cache\0.1.1\herdr-updater.exe"
 $SourceBinary = if (Test-Path -LiteralPath $DevBinary) { $DevBinary } else { $CachedBinary }
 $DestinationDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
 New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
