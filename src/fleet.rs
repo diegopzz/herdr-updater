@@ -1,5 +1,4 @@
-//! Fleet mode — the reason this project exists rather than a PR to the
-//! reference.
+//! Fleet mode — show cross-host drift that host-local checks cannot see.
 //!
 //! A host-local updater cannot see the failure that actually costs you a day:
 //! several machines quietly running different versions, each of them
@@ -22,8 +21,10 @@ use crate::herdr;
 /// which most people who need this tool already maintain. Sharing that file
 /// means the fleet is defined once, and a host added for mirroring is
 /// automatically a host we keep updated.
-const CONFIG_CANDIDATES: [&str; 2] =
-    [".config/herdr-updater/hosts.toml", ".config/herdr-mirror/hosts.toml"];
+const CONFIG_CANDIDATES: [&str; 2] = [
+    ".config/herdr-updater/hosts.toml",
+    ".config/herdr-mirror/hosts.toml",
+];
 
 #[derive(Debug, Deserialize, Default)]
 struct HostsFile {
@@ -48,33 +49,138 @@ pub struct HostState {
     pub version: Option<String>,
     pub protocol: Option<u32>,
     pub server_running: bool,
+    pub plugins: BTreeMap<String, FleetPlugin>,
+    pub plugin_error: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FleetPlugin {
+    pub version: Option<String>,
+    pub source: String,
+    pub revision: Option<String>,
+    pub owner: Option<String>,
+    pub repo: Option<String>,
+    pub subdir: Option<String>,
+    pub requested_ref: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginEnvelope {
+    result: PluginResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginResult {
+    plugins: Vec<FleetPluginJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetPluginJson {
+    plugin_id: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    source: Option<FleetSourceJson>,
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetSourceJson {
+    kind: String,
+    #[serde(default)]
+    resolved_commit: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+    #[serde(default)]
+    requested_ref: Option<String>,
+}
+
+fn parse_plugins(text: &str) -> Result<BTreeMap<String, FleetPlugin>, String> {
+    let parsed: PluginEnvelope =
+        serde_json::from_str(text).map_err(|e| format!("unparseable plugin inventory: {e}"))?;
+    Ok(parsed
+        .result
+        .plugins
+        .into_iter()
+        .map(|plugin| {
+            let source = plugin
+                .source
+                .as_ref()
+                .map(|s| s.kind.clone())
+                .unwrap_or_default();
+            let revision = plugin
+                .source
+                .as_ref()
+                .and_then(|s| s.resolved_commit.clone());
+            (
+                plugin.plugin_id,
+                FleetPlugin {
+                    version: plugin.version,
+                    source,
+                    revision,
+                    owner: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.owner.clone()),
+                    repo: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.repo.clone()),
+                    subdir: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.subdir.clone()),
+                    requested_ref: plugin
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.requested_ref.clone()),
+                    enabled: plugin.enabled,
+                },
+            )
+        })
+        .collect())
 }
 
 /// An ssh alias is interpolated into an argv we hand to `ssh`. It comes from a
 /// config file rather than the network, but "config file" is not "trusted
 /// input" — reject anything that is not plainly a host alias so a stray value
 /// can never grow into an option or a second argument.
-fn valid_alias(s: &str) -> bool {
+pub(crate) fn valid_alias(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s.len() <= 128
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Load the fleet definition, returning the file we actually read so the
 /// report can say which config won. "Which config won?" should never be a
 /// guess — that ambiguity is its own class of bug.
-fn load_hosts() -> (Vec<(String, String)>, Option<PathBuf>) {
-    let Some(home) = home() else { return (vec![], None) };
+pub(crate) fn load_hosts() -> (Vec<(String, String)>, Option<PathBuf>) {
+    let Some(home) = home() else {
+        return (vec![], None);
+    };
     for candidate in CONFIG_CANDIDATES {
         let path = home.join(candidate);
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Ok(parsed) = toml::from_str::<HostsFile>(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(parsed) = toml::from_str::<HostsFile>(&text) else {
+            continue;
+        };
         let hosts = parsed
             .hosts
             .into_iter()
@@ -95,7 +201,7 @@ fn load_hosts() -> (Vec<(String, String)>, Option<PathBuf>) {
 /// frequently has neither `~/.local/bin` on PATH nor a profile that adds it.
 /// Getting this wrong is exactly the failure that makes a healthy host look
 /// like it has no herdr at all.
-fn probe_remote(target: &str, timeout: Duration) -> HostState {
+pub(crate) fn probe_remote(target: &str, timeout: Duration) -> HostState {
     let mut st = HostState {
         host: target.to_string(),
         target: target.to_string(),
@@ -103,17 +209,27 @@ fn probe_remote(target: &str, timeout: Duration) -> HostState {
         version: None,
         protocol: None,
         server_running: false,
+        plugins: BTreeMap::new(),
+        plugin_error: None,
         error: None,
     };
     if !valid_alias(target) {
-        st.error = Some(format!("refusing to ssh to an implausible alias: {target:?}"));
+        st.error = Some(format!(
+            "refusing to ssh to an implausible alias: {target:?}"
+        ));
         return st;
     }
-    let remote = "if command -v herdr >/dev/null 2>&1; then herdr status --json; \
-                  elif [ -x \"$HOME/.local/bin/herdr\" ]; then \"$HOME/.local/bin/herdr\" status --json; \
-                  else echo NO_HERDR; fi";
+    let remote = "if command -v herdr >/dev/null 2>&1; then H=herdr; \
+                  elif [ -x \"$HOME/.local/bin/herdr\" ]; then H=\"$HOME/.local/bin/herdr\"; \
+                  else echo NO_HERDR; exit 0; fi; \
+                  \"$H\" status --json; printf '\\n__HERDR_UPDATER_PLUGINS__\\n'; \
+                  \"$H\" plugin list --json";
     let connect = format!("ConnectTimeout={}", timeout.as_secs().min(15));
-    let out = exec::run("ssh", &["-o", "BatchMode=yes", "-o", &connect, target, remote], timeout);
+    let out = exec::run(
+        "ssh",
+        &["-o", "BatchMode=yes", "-o", &connect, target, remote],
+        timeout,
+    );
     match out {
         Err(e) => st.error = Some(e.to_string()),
         Ok(o) if o.stdout.contains("NO_HERDR") => {
@@ -130,19 +246,29 @@ fn probe_remote(target: &str, timeout: Duration) -> HostState {
                 o.stderr.trim().lines().next().unwrap_or("(no stderr)")
             ));
         }
-        Ok(o) => match serde_json::from_str::<herdr::StatusJson>(o.stdout.trim()) {
-            Ok(s) => {
-                st.version = Some(s.client.version);
-                st.protocol = Some(s.client.protocol);
-                st.server_running = s.server.map(|x| x.running).unwrap_or(false);
+        Ok(o) => {
+            let (status_text, plugins_text) = o
+                .stdout
+                .split_once("__HERDR_UPDATER_PLUGINS__")
+                .unwrap_or((o.stdout.as_str(), ""));
+            match serde_json::from_str::<herdr::StatusJson>(status_text.trim()) {
+                Ok(s) => {
+                    st.version = Some(s.client.version);
+                    st.protocol = Some(s.client.protocol);
+                    st.server_running = s.server.map(|x| x.running).unwrap_or(false);
+                }
+                Err(e) => st.error = Some(format!("unparseable status: {e}")),
             }
-            Err(e) => st.error = Some(format!("unparseable status: {e}")),
-        },
+            match parse_plugins(plugins_text.trim()) {
+                Ok(plugins) => st.plugins = plugins,
+                Err(error) => st.plugin_error = Some(error),
+            }
+        }
     }
     st
 }
 
-fn probe_local(timeout: Duration) -> HostState {
+pub(crate) fn probe_local(timeout: Duration) -> HostState {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
     let mut st = HostState {
         host: "this machine".into(),
@@ -151,6 +277,8 @@ fn probe_local(timeout: Duration) -> HostState {
         version: None,
         protocol: None,
         server_running: false,
+        plugins: BTreeMap::new(),
+        plugin_error: None,
         error: None,
     };
     match herdr::status(&bin, timeout) {
@@ -160,6 +288,14 @@ fn probe_local(timeout: Duration) -> HostState {
             st.server_running = s.server.map(|x| x.running).unwrap_or(false);
         }
         Err(e) => st.error = Some(e),
+    }
+    match exec::run(&bin, &["plugin", "list", "--json"], timeout) {
+        Ok(out) if out.ok() => match parse_plugins(&out.stdout) {
+            Ok(plugins) => st.plugins = plugins,
+            Err(error) => st.plugin_error = Some(error),
+        },
+        Ok(out) => st.plugin_error = Some(format!("plugin list exited {}", out.code)),
+        Err(error) => st.plugin_error = Some(error.to_string()),
     }
     st
 }
@@ -183,6 +319,15 @@ const SPLIT_WARNING: &str = "  \u{26a0} PROTOCOL SPLIT — hosts are on differen
     Update before relying on --remote, and close the drift regardless.";
 
 pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
+    let (states, source) = collect_states(only, timeout);
+
+    render_fleet(states, source, json)
+}
+
+pub(crate) fn collect_states(
+    only: &[String],
+    timeout: Duration,
+) -> (Vec<HostState>, Option<PathBuf>) {
     let (mut hosts, source) = load_hosts();
     if !only.is_empty() {
         hosts.retain(|(name, target)| only.contains(name) || only.contains(target));
@@ -206,9 +351,12 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
         }
     }
     drop(tx);
-    states.extend(rx.into_iter());
+    states.extend(rx);
     states.sort_by(|a, b| b.local.cmp(&a.local).then(a.host.cmp(&b.host)));
+    (states, source)
+}
 
+fn render_fleet(states: Vec<HostState>, source: Option<PathBuf>, json: bool) -> i32 {
     // Drift is computed only over hosts we could actually read. An unreachable
     // host is reported as unknown, never quietly folded into "the fleet
     // agrees" — that is the exact failure this tool exists to prevent.
@@ -219,6 +367,26 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
     let protocol_split = protocols.len() > 1;
     let version_split = versions.len() > 1;
     let unreachable = states.iter().filter(|s| s.error.is_some()).count();
+    let plugin_unknown = states.iter().filter(|s| s.plugin_error.is_some()).count();
+    let reachable: Vec<&HostState> = states
+        .iter()
+        .filter(|state| state.error.is_none())
+        .collect();
+    let plugin_ids: std::collections::BTreeSet<&str> = reachable
+        .iter()
+        .flat_map(|state| state.plugins.keys().map(String::as_str))
+        .collect();
+    let plugin_drift: Vec<String> = plugin_ids
+        .into_iter()
+        .filter(|plugin_id| {
+            let signatures: std::collections::BTreeSet<Option<&FleetPlugin>> = reachable
+                .iter()
+                .map(|state| state.plugins.get(*plugin_id))
+                .collect();
+            signatures.len() > 1
+        })
+        .map(str::to_string)
+        .collect();
 
     if json {
         let doc = serde_json::json!({
@@ -227,8 +395,13 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
             "protocol_split": protocol_split,
             "version_split": version_split,
             "unreachable": unreachable,
+            "plugin_inventory_unknown": plugin_unknown,
+            "plugin_drift": plugin_drift,
         });
-        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+        );
     } else {
         match &source {
             Some(p) => println!("fleet (from {})", p.display()),
@@ -238,7 +411,10 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
             ),
         }
         println!();
-        println!("  {:<16} {:<14} {:<9} {:<9}", "HOST", "HERDR", "PROTOCOL", "SERVER");
+        println!(
+            "  {:<16} {:<14} {:<9} {:<9}",
+            "HOST", "HERDR", "PROTOCOL", "SERVER"
+        );
         for s in &states {
             let server = if s.error.is_some() {
                 "-"
@@ -260,9 +436,14 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
                 "  {:<16} {:<14} {:<9} {:<9}{}",
                 s.host,
                 version,
-                s.protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                s.protocol
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".into()),
                 server,
-                s.error.as_deref().map(|e| format!("  {e}")).unwrap_or_default(),
+                s.error
+                    .as_deref()
+                    .map(|e| format!("  {e}"))
+                    .unwrap_or_default(),
             );
         }
         println!();
@@ -282,11 +463,21 @@ pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
                  not assumed to agree."
             );
         }
+        if plugin_unknown > 0 {
+            println!(
+                "  {plugin_unknown} host(s) returned no usable plugin inventory — plugin drift is unknown there."
+            );
+        }
+        if plugin_drift.is_empty() && plugin_unknown == 0 && unreachable == 0 {
+            println!("  plugin inventory agrees across the fleet.");
+        } else if !plugin_drift.is_empty() {
+            println!("  plugin drift: {}", plugin_drift.join(", "));
+        }
     }
 
-    if unreachable > 0 {
+    if unreachable > 0 || plugin_unknown > 0 {
         2
-    } else if protocol_split || version_split {
+    } else if protocol_split || version_split || !plugin_drift.is_empty() {
         1
     } else {
         0
@@ -311,7 +502,10 @@ mod tests {
     #[test]
     fn hosts_file_defaults_target_to_the_table_key() {
         let f: HostsFile = toml::from_str("[hosts.macbook]\n").unwrap();
-        assert_eq!(f.hosts["macbook"].target, None, "absent target means: use the key");
+        assert_eq!(
+            f.hosts["macbook"].target, None,
+            "absent target means: use the key"
+        );
     }
 
     #[test]
@@ -334,5 +528,17 @@ always_control = true
         .unwrap();
         assert_eq!(f.hosts.len(), 2);
         assert_eq!(f.hosts["ts-ubuntu"].target.as_deref(), Some("ts-ubuntu"));
+    }
+
+    #[test]
+    fn parses_plugin_inventory_without_guessing_registry_paths() {
+        let text = r#"{"result":{"plugins":[{"plugin_id":"mirror","version":"0.3.1","source":{"kind":"local"}},{"plugin_id":"files","source":{"kind":"github","resolved_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}"#;
+        let plugins = parse_plugins(text).unwrap();
+        assert_eq!(plugins["mirror"].source, "local");
+        assert!(!plugins["mirror"].enabled);
+        assert_eq!(
+            plugins["files"].revision.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }

@@ -70,10 +70,16 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreState {
     pub installed: String,
+    pub channel: Option<String>,
+    pub binary: Option<String>,
     pub protocol: u32,
+    pub server_status: Option<String>,
     pub server_running: bool,
     pub server_version: Option<String>,
+    pub server_protocol: Option<u32>,
+    pub compatible: Option<bool>,
     pub live_handoff: bool,
+    pub detached_server_daemon: bool,
     pub restart_needed: bool,
     pub latest: Option<String>,
     pub latest_protocol: Option<u32>,
@@ -89,10 +95,16 @@ impl CoreState {
     fn errored(msg: String) -> Self {
         CoreState {
             installed: String::new(),
+            channel: None,
+            binary: None,
             protocol: 0,
+            server_status: None,
             server_running: false,
             server_version: None,
+            server_protocol: None,
+            compatible: None,
             live_handoff: false,
+            detached_server_daemon: false,
             restart_needed: false,
             latest: None,
             latest_protocol: None,
@@ -150,10 +162,22 @@ pub fn inspect(herdr_bin: &str, timeout: Duration) -> CoreState {
     let server = st.server.clone();
     let mut state = CoreState {
         installed: st.client.version.clone(),
+        channel: st.client.channel.clone(),
+        binary: st.client.binary.clone(),
         protocol: st.client.protocol,
+        server_status: server.as_ref().and_then(|s| s.status.clone()),
         server_running: server.as_ref().map(|s| s.running).unwrap_or(false),
         server_version: server.as_ref().and_then(|s| s.version.clone()),
-        live_handoff: server.as_ref().map(|s| s.capabilities.live_handoff).unwrap_or(false),
+        server_protocol: server.as_ref().and_then(|s| s.protocol),
+        compatible: server.as_ref().and_then(|s| s.compatible),
+        live_handoff: server
+            .as_ref()
+            .map(|s| s.capabilities.live_handoff)
+            .unwrap_or(false),
+        detached_server_daemon: server
+            .as_ref()
+            .map(|s| s.capabilities.detached_server_daemon)
+            .unwrap_or(false),
         restart_needed: server.as_ref().map(|s| s.restart_needed).unwrap_or(false),
         latest: None,
         latest_protocol: None,
@@ -203,6 +227,120 @@ pub fn gate(state: &CoreState) -> Result<(), Hold> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplyResult {
+    pub installed: String,
+    pub integrations_refreshed: Vec<String>,
+}
+
+fn outdated_integrations(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (name, status) = line.split_once(':')?;
+            let name = name.trim();
+            let status = status.trim().to_ascii_lowercase();
+            let valid_name = !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+            (valid_name && !status.contains("current") && !status.contains("not installed"))
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn refresh_integrations(herdr_bin: &str, timeout: Duration) -> Result<Vec<String>, String> {
+    let out = exec::run(
+        herdr_bin,
+        &["integration", "status", "--outdated-only"],
+        timeout,
+    )
+    .map_err(|e| format!("integration status: {e}"))?;
+    if !out.ok() {
+        return Err(format!(
+            "integration status exited {}: {}",
+            out.code,
+            out.stderr.lines().next().unwrap_or("no stderr")
+        ));
+    }
+    let agents = outdated_integrations(&out.stdout);
+    for agent in &agents {
+        let installed = exec::run(herdr_bin, &["integration", "install", agent], timeout)
+            .map_err(|e| format!("integration install {agent}: {e}"))?;
+        if !installed.ok() {
+            return Err(format!(
+                "integration install {agent} exited {}: {}",
+                installed.code,
+                installed.stderr.lines().next().unwrap_or("no stderr")
+            ));
+        }
+    }
+    Ok(agents)
+}
+
+pub fn apply(
+    herdr_bin: &str,
+    before: &CoreState,
+    timeout: Duration,
+) -> Result<ApplyResult, String> {
+    gate(before).map_err(|hold| match hold {
+        Hold::UpToDate => "herdr is already current".to_string(),
+        Hold::NoLiveHandoff => "running server does not support live handoff".to_string(),
+        Hold::Unknown(error) => error,
+    })?;
+    let expected = before
+        .latest
+        .as_deref()
+        .ok_or_else(|| "latest herdr version is unknown".to_string())?;
+    let out = exec::run(herdr_bin, &["update", "--handoff"], timeout)
+        .map_err(|e| format!("herdr update --handoff: {e}"))?;
+    if !out.ok() {
+        return Err(format!(
+            "herdr update --handoff exited {}: {}",
+            out.code,
+            out.stderr.lines().next().unwrap_or("no stderr")
+        ));
+    }
+
+    let after = status(herdr_bin, timeout)?;
+    if after.client.version != expected {
+        return Err(format!(
+            "post-update client is {}, expected {expected}",
+            after.client.version
+        ));
+    }
+    if before.server_running {
+        let server = after
+            .server
+            .filter(|server| server.running)
+            .ok_or_else(|| {
+                "server was running before update but is not running after handoff".to_string()
+            })?;
+        if server.version.as_deref() != Some(expected) {
+            return Err(format!(
+                "post-handoff server is {}, expected {expected}",
+                server.version.as_deref().unwrap_or("unknown")
+            ));
+        }
+    }
+    let integrations_refreshed = refresh_integrations(herdr_bin, timeout)?;
+    let verify = exec::run(
+        herdr_bin,
+        &["integration", "status", "--outdated-only"],
+        timeout,
+    )
+    .map_err(|e| format!("integration verification: {e}"))?;
+    if !verify.ok() || !outdated_integrations(&verify.stdout).is_empty() {
+        return Err("one or more Herdr integrations remain outdated".into());
+    }
+    Ok(ApplyResult {
+        installed: expected.to_string(),
+        integrations_refreshed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,10 +373,16 @@ mod tests {
     fn state(installed: &str, latest: Option<&str>, running: bool, handoff: bool) -> CoreState {
         CoreState {
             installed: installed.into(),
+            channel: Some("stable".into()),
+            binary: None,
             protocol: 20,
+            server_status: Some("running".into()),
             server_running: running,
             server_version: Some(installed.into()),
+            server_protocol: Some(20),
+            compatible: Some(true),
             live_handoff: handoff,
+            detached_server_daemon: true,
             restart_needed: false,
             latest: latest.map(|s| s.to_string()),
             latest_protocol: Some(20),
@@ -250,7 +394,10 @@ mod tests {
 
     #[test]
     fn up_to_date_is_held() {
-        assert_eq!(gate(&state("0.8.2", Some("0.8.2"), true, true)), Err(Hold::UpToDate));
+        assert_eq!(
+            gate(&state("0.8.2", Some("0.8.2"), true, true)),
+            Err(Hold::UpToDate)
+        );
     }
 
     #[test]
@@ -276,5 +423,11 @@ mod tests {
         let mut s = state("0.8.2", None, true, true);
         s.error = Some("network down".into());
         assert!(matches!(gate(&s), Err(Hold::Unknown(_))));
+    }
+
+    #[test]
+    fn parses_only_outdated_installed_integrations() {
+        let output = "codex: outdated (v7 -> v8)\nclaude: current (v8)\npi: not installed\n";
+        assert_eq!(outdated_integrations(output), vec!["codex"]);
     }
 }
