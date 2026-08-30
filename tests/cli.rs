@@ -155,3 +155,101 @@ fn invalid_marketplace_sort_is_a_usage_error() {
     );
     assert_eq!(output.status.code(), Some(3));
 }
+
+fn write_executable(path: &std::path::Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn release_launcher_falls_back_to_https_when_gh_is_unauthenticated() {
+    let root = std::env::temp_dir().join(format!(
+        "herdr-updater-launcher-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let plugin_bin = root.join("plugin/bin");
+    let tools = root.join("tools");
+    std::fs::create_dir_all(&plugin_bin).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+
+    let launcher = plugin_bin.join("herdr-updater");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bin/herdr-updater"),
+        &launcher,
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    write_executable(
+        &tools.join("gh"),
+        "#!/bin/sh\nprintf attempted > \"$TEST_GH_MARKER\"\nexit 1\n",
+    );
+    write_executable(
+        &tools.join("uname"),
+        "#!/bin/sh\ncase \"$1\" in -s) printf 'Linux\\n' ;; -m) printf 'x86_64\\n' ;; esac\n",
+    );
+    write_executable(
+        &tools.join("curl"),
+        r#"#!/bin/sh
+out=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$out" in
+  *checksums*) printf 'fixturehash  %s\n' "$TEST_ASSET" > "$out" ;;
+  *) printf 'fixture archive\n' > "$out" ;;
+esac
+printf used >> "$TEST_CURL_MARKER"
+"#,
+    );
+    write_executable(
+        &tools.join("sha256sum"),
+        "#!/bin/sh\nprintf 'fixturehash  %s\\n' \"$1\"\n",
+    );
+    write_executable(
+        &tools.join("tar"),
+        r#"#!/bin/sh
+destination=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C) destination=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '#!/bin/sh\nprintf "%%s\\n" "$TEST_VERSION"\n' > "$destination/herdr-updater"
+chmod 755 "$destination/herdr-updater"
+"#,
+    );
+
+    let version = env!("CARGO_PKG_VERSION");
+    let asset = format!("herdr-updater-{version}-x86_64-unknown-linux-gnu.tar.gz");
+    let gh_marker = root.join("gh-attempted");
+    let curl_marker = root.join("curl-used");
+    let output = Command::new("sh")
+        .arg(&launcher)
+        .arg("version")
+        .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+        .env("TEST_ASSET", &asset)
+        .env("TEST_VERSION", version)
+        .env("TEST_GH_MARKER", &gh_marker)
+        .env("TEST_CURL_MARKER", &curl_marker)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), version);
+    assert!(gh_marker.is_file());
+    assert!(curl_marker.is_file());
+    assert!(plugin_bin
+        .join(format!(".cache/{version}/herdr-updater"))
+        .is_file());
+    std::fs::remove_dir_all(root).unwrap();
+}

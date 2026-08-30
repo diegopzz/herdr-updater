@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Version = "0.1.0"
+$Version = "0.1.1"
 $Repository = "diegopzz/herdr-updater"
 $Root = Split-Path -Parent $PSScriptRoot
 $DevBinary = Join-Path $Root "target\release\herdr-updater.exe"
@@ -25,13 +25,21 @@ if (-not (Test-Path -LiteralPath $Binary)) {
     try {
         $AssetPath = Join-Path $Temp $Asset
         $ChecksumPath = Join-Path $Temp $Checksums
+        $Downloaded = $false
         if (Get-Command gh -ErrorAction SilentlyContinue) {
-            & gh release download "v$Version" --repo $Repository --pattern $Asset --pattern $Checksums --dir $Temp
-            if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
-        } else {
+            & gh release download "v$Version" --repo $Repository --pattern $Asset --pattern $Checksums --dir $Temp 2>$null
+            $Downloaded = $LASTEXITCODE -eq 0 -and
+                (Test-Path -LiteralPath $AssetPath) -and
+                (Test-Path -LiteralPath $ChecksumPath)
+            if (-not $Downloaded) {
+                Remove-Item -LiteralPath $AssetPath, $ChecksumPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $Downloaded) {
             $Base = "https://github.com/$Repository/releases/download/v$Version"
             Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset" -OutFile $AssetPath
             Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Checksums" -OutFile $ChecksumPath
+            $Downloaded = $true
         }
 
         $Expected = $null

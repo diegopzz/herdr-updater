@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 REPOSITORY="diegopzz/herdr-updater"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
@@ -28,15 +28,24 @@ if [ ! -x "$binary" ]; then
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-updater.XXXXXX")
     trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
     checksums="checksums-$VERSION.txt"
+    downloaded=false
     if command -v gh >/dev/null 2>&1; then
-        gh release download "v$VERSION" --repo "$REPOSITORY" \
-            --pattern "$asset" --pattern "$checksums" --dir "$tmp"
-    elif command -v curl >/dev/null 2>&1; then
+        if gh release download "v$VERSION" --repo "$REPOSITORY" \
+            --pattern "$asset" --pattern "$checksums" --dir "$tmp" >/dev/null 2>&1 \
+            && [ -f "$tmp/$asset" ] && [ -f "$tmp/$checksums" ]; then
+            downloaded=true
+        else
+            rm -f -- "$tmp/$asset" "$tmp/$checksums"
+        fi
+    fi
+    if [ "$downloaded" = false ] && command -v curl >/dev/null 2>&1; then
         base="https://github.com/$REPOSITORY/releases/download/v$VERSION"
         curl -fsSL --proto '=https' --tlsv1.2 "$base/$asset" -o "$tmp/$asset"
         curl -fsSL --proto '=https' --tlsv1.2 "$base/$checksums" -o "$tmp/$checksums"
-    else
-        printf 'herdr-updater: gh or curl is required for the first run\n' >&2
+        downloaded=true
+    fi
+    if [ "$downloaded" = false ]; then
+        printf 'herdr-updater: could not download the release with gh or curl\n' >&2
         exit 2
     fi
 
