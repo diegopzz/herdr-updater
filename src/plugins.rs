@@ -23,6 +23,8 @@ pub(crate) struct InstalledPlugin {
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
+    pub min_herdr_version: Option<String>,
+    #[serde(default)]
     pub plugin_root: Option<String>,
     #[serde(default)]
     pub source: Option<PluginSource>,

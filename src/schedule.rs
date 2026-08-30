@@ -10,6 +10,7 @@ use crate::exec;
 const STATE_FILE: &str = "schedule-state.json";
 const LOCK_DIR: &str = "schedule.lock";
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+const MIN_SCHEDULER_TICK: Duration = Duration::from_secs(60);
 const MAX_SCHEDULER_TICK: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -340,7 +341,7 @@ fn install(
     );
     write_owned(&resource, plist.as_bytes())?;
     let domain = launch_domain(timeout)?;
-    let _ = exec::run("launchctl", &["bootout", &domain, label], timeout);
+    launchd_unload(&domain, label, timeout)?;
     run_ok(
         "launchctl",
         &["bootstrap", &domain, resource.to_string_lossy().as_ref()],
@@ -356,7 +357,7 @@ fn remove(config_dir: &Path, timeout: Duration) -> Result<Status, String> {
     let resource = home()?.join(format!("Library/LaunchAgents/{label}.plist"));
     if exec::have("launchctl") {
         let domain = launch_domain(timeout)?;
-        let _ = exec::run("launchctl", &["bootout", &domain, label], timeout);
+        launchd_unload(&domain, label, timeout)?;
     }
     remove_owned(&resource)?;
     status(config_dir)
@@ -381,6 +382,57 @@ fn launch_domain(timeout: Duration) -> Result<String, String> {
         return Err("cannot read the current macOS uid".into());
     }
     Ok(format!("gui/{}", output.trimmed()))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_service_target(domain: &str, label: &str) -> String {
+    format!("{domain}/{label}")
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_unload(domain: &str, label: &str, timeout: Duration) -> Result<(), String> {
+    let service_target = launchd_service_target(domain, label);
+    let before = exec::run("launchctl", &["print", &service_target], timeout)
+        .map_err(|error| format!("launchd status: {error}"))?;
+    if !before.ok() {
+        return if launchd_service_not_loaded(&before) {
+            Ok(())
+        } else {
+            Err(format!(
+                "launchd status exited {}: {}",
+                before.code,
+                before.stderr.lines().next().unwrap_or("no stderr")
+            ))
+        };
+    }
+    run_ok(
+        "launchctl",
+        &["bootout", &service_target],
+        timeout,
+        "launchd bootout",
+    )?;
+    let after = exec::run("launchctl", &["print", &service_target], timeout)
+        .map_err(|error| format!("launchd unload verification: {error}"))?;
+    if launchd_service_not_loaded(&after) {
+        Ok(())
+    } else if after.ok() {
+        Err(format!("launchd service {service_target} is still loaded"))
+    } else {
+        Err(format!(
+            "launchd unload verification exited {}: {}",
+            after.code,
+            after.stderr.lines().next().unwrap_or("no stderr")
+        ))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_service_not_loaded(output: &exec::Output) -> bool {
+    if output.ok() {
+        return false;
+    }
+    let message = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    message.contains("could not find service") || message.contains("service not found")
 }
 
 #[cfg(target_os = "windows")]
@@ -493,7 +545,7 @@ fn scheduler_tick(config: &Config) -> Duration {
             tick = tick.min(candidate);
         }
     }
-    Duration::from_secs(tick.as_secs().max(1))
+    Duration::from_secs(tick.as_secs().max(MIN_SCHEDULER_TICK.as_secs()))
 }
 
 fn prepare_initial_state(config_dir: &Path, config: &Config) -> Result<StateBackup, String> {
@@ -739,6 +791,38 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(scheduler_tick(&config), Duration::from_secs(90));
+
+        let config = Config {
+            initial_delay: "1s".into(),
+            jitter: "1s".into(),
+            ..Config::default()
+        };
+        assert_eq!(scheduler_tick(&config), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn launchd_bootout_uses_a_single_domain_qualified_service_target() {
+        assert_eq!(
+            launchd_service_target("gui/501", "io.github.diegopzz.herdr-updater"),
+            "gui/501/io.github.diegopzz.herdr-updater"
+        );
+    }
+
+    #[test]
+    fn launchd_only_ignores_a_confirmed_missing_service() {
+        let missing = exec::Output {
+            code: 113,
+            stdout: String::new(),
+            stderr: "Bad request. Could not find service in domain for user gui: 501".into(),
+        };
+        assert!(launchd_service_not_loaded(&missing));
+
+        let denied = exec::Output {
+            code: 1,
+            stdout: String::new(),
+            stderr: "Operation not permitted".into(),
+        };
+        assert!(!launchd_service_not_loaded(&denied));
     }
 
     #[test]

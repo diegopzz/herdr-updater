@@ -30,6 +30,8 @@ pub struct DesiredPlugin {
     pub source: String,
     pub revision: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_herdr_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -168,12 +170,14 @@ fn derive_local(
             source: install_source.clone(),
             revision: revision.clone(),
             enabled: plugin.enabled,
+            min_herdr_version: plugin.min_herdr_version.clone(),
         })?;
         desired.push(DesiredPlugin {
             plugin_id: plugin.plugin_id,
             source: install_source,
             revision,
             enabled: plugin.enabled,
+            min_herdr_version: plugin.min_herdr_version,
         });
     }
     desired.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
@@ -365,28 +369,30 @@ fn plan_host(state: &HostState, desired: &DesiredState) -> Vec<SyncDecision> {
     let mut decisions = Vec::new();
     for plugin in &desired.plugins {
         let remote = state.plugins.get(&plugin.plugin_id);
-        let (previous, action) = match remote {
-            None => (None, SyncAction::Install),
-            Some(remote) if remote.source == "local" => (
-                remote.revision.clone(),
-                SyncAction::Hold("remote plugin is linked; never overwrite a local fork".into()),
-            ),
-            Some(remote) if source_of(remote).as_deref() != Some(plugin.source.as_str()) => (
-                remote.revision.clone(),
-                SyncAction::Hold("remote plugin has a different source".into()),
-            ),
-            Some(remote) if remote.revision.as_deref() != Some(plugin.revision.as_str()) => {
-                (remote.revision.clone(), SyncAction::Update)
+        let previous = remote.and_then(|plugin| plugin.revision.clone());
+        let action = if let Some(reason) = compatibility_hold(state, plugin) {
+            SyncAction::Hold(reason)
+        } else {
+            match remote {
+                None => SyncAction::Install,
+                Some(remote) if remote.source == "local" => {
+                    SyncAction::Hold("remote plugin is linked; never overwrite a local fork".into())
+                }
+                Some(remote) if source_of(remote).as_deref() != Some(plugin.source.as_str()) => {
+                    SyncAction::Hold("remote plugin has a different source".into())
+                }
+                Some(remote) if remote.revision.as_deref() != Some(plugin.revision.as_str()) => {
+                    SyncAction::Update
+                }
+                Some(remote) if remote.enabled != plugin.enabled => {
+                    if plugin.enabled {
+                        SyncAction::Enable
+                    } else {
+                        SyncAction::Disable
+                    }
+                }
+                Some(_) => SyncAction::Current,
             }
-            Some(remote) if remote.enabled != plugin.enabled => (
-                remote.revision.clone(),
-                if plugin.enabled {
-                    SyncAction::Enable
-                } else {
-                    SyncAction::Disable
-                },
-            ),
-            Some(remote) => (remote.revision.clone(), SyncAction::Current),
         };
         decisions.push(SyncDecision {
             host: state.host.clone(),
@@ -419,6 +425,35 @@ fn plan_host(state: &HostState, desired: &DesiredState) -> Vec<SyncDecision> {
         }
     }
     decisions
+}
+
+fn compatibility_hold(state: &HostState, plugin: &DesiredPlugin) -> Option<String> {
+    let Some(minimum_text) = plugin.min_herdr_version.as_deref() else {
+        return Some("desired plugin is missing min_herdr_version; re-export desired state".into());
+    };
+    let Some(minimum) = parse_semver(minimum_text) else {
+        return Some(format!(
+            "desired plugin declares invalid min_herdr_version {minimum_text:?}"
+        ));
+    };
+    let Some(current_text) = state.version.as_deref() else {
+        return Some("remote Herdr version is unknown".into());
+    };
+    let Some(current) = parse_semver(current_text) else {
+        return Some(format!("remote Herdr version {current_text:?} is invalid"));
+    };
+    (current < minimum)
+        .then(|| format!("requires Herdr {minimum_text} or newer; remote has {current_text}"))
+}
+
+fn parse_semver(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let core = value.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
 }
 
 fn source_of(plugin: &FleetPlugin) -> Option<String> {
@@ -832,6 +867,7 @@ mod tests {
                 source: "diegopzz/herdr-sample".into(),
                 revision: "a".repeat(40),
                 enabled: true,
+                min_herdr_version: Some("0.8.2".into()),
             }],
         }
     }
@@ -858,6 +894,45 @@ mod tests {
     fn missing_plugin_is_an_install() {
         let decisions = plan_host(&host(None), &desired());
         assert!(matches!(decisions[0].action, SyncAction::Install));
+    }
+
+    #[test]
+    fn older_same_protocol_host_is_held_for_plugin_compatibility() {
+        let mut state = host(None);
+        state.version = Some("0.8.1".into());
+        let decisions = plan_host(&state, &desired());
+        assert!(matches!(
+            &decisions[0].action,
+            SyncAction::Hold(reason) if reason.contains("requires Herdr 0.8.2")
+        ));
+    }
+
+    #[test]
+    fn invalid_minimum_version_is_held_before_install() {
+        let mut desired = desired();
+        desired.plugins[0].min_herdr_version = Some("latest".into());
+        let decisions = plan_host(&host(None), &desired);
+        assert!(matches!(
+            &decisions[0].action,
+            SyncAction::Hold(reason) if reason.contains("invalid min_herdr_version")
+        ));
+    }
+
+    #[test]
+    fn existing_desired_plugin_without_minimum_version_remains_readable() {
+        let text = format!(
+            "plugin_id = \"sample\"\nsource = \"diegopzz/herdr-sample\"\nrevision = \"{}\"\nenabled = true\n",
+            "a".repeat(40)
+        );
+        let plugin: DesiredPlugin = toml::from_str(&text).unwrap();
+        assert_eq!(plugin.min_herdr_version, None);
+        let mut desired = desired();
+        desired.plugins = vec![plugin];
+        let decisions = plan_host(&host(None), &desired);
+        assert!(matches!(
+            &decisions[0].action,
+            SyncAction::Hold(reason) if reason.contains("re-export desired state")
+        ));
     }
 
     #[test]

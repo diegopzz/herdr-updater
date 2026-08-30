@@ -153,7 +153,9 @@ on macOS, or Task Scheduler task on Windows. The internal state prevents double
 runs, applies the initial delay on every platform, honors quiet hours, adds
 bounded jitter, and uses capped retry backoff. A bounded scheduler heartbeat
 observes the state deadline without stretching a jittered interval toward the
-next full interval.
+next full interval. The recurring native heartbeat is clamped to a one-minute
+minimum, so sub-minute delay or jitter values have one-minute execution
+resolution instead of creating a one-second background loop.
 Installing or removing a schedule is always explicit; installing the plugin
 does not silently create an operating-system task. Rerun `schedule install`
 after changing timing settings so the native scheduler receives the new
@@ -211,11 +213,13 @@ herdr-updater sync plan
 herdr-updater sync apply --yes
 ```
 
-`desired.toml` records exact resolved commits and enabled state for managed
-GitHub plugins. Linked plugins, local forks, different sources, remote-only
-plugins, protocol splits, unreachable hosts, and incomplete metadata are held,
-never overwritten or uninstalled. Apply re-probes each changed host and only
-reports success when source, commit, and enabled state match. Set
+`desired.toml` records exact resolved commits, enabled state, and each managed
+plugin's minimum Herdr version. Linked plugins, local forks, different sources,
+remote-only plugins, incompatible Herdr versions, protocol splits, unreachable
+hosts, and incomplete metadata are held, never overwritten or uninstalled.
+Apply re-probes each changed host and only reports success when source, commit,
+and enabled state match. Desired files created before compatibility metadata was
+added remain readable but hold changes until `sync export` refreshes them. Set
 `sync_update_settings = true` only when every target should share this
 plugin's non-secret update policy; machine-local SSH configuration is never
 copied.
