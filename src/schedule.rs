@@ -256,7 +256,8 @@ fn install(
     let executable = current_exe()?;
     let tick = scheduler_tick(config);
     let service_text = format!(
-        "[Unit]\nDescription=Check Herdr core and plugins\n\n[Service]\nType=oneshot\nSuccessExitStatus=1\nExecStart={} schedule run --config {}\n",
+        "[Unit]\nDescription=Check Herdr core and plugins\n\n[Service]\nType=oneshot\nSuccessExitStatus=1\nEnvironment=PATH={}\nExecStart={} schedule run --config {}\n",
+        scheduler_path(),
         systemd_quote(&executable),
         systemd_quote(config_path)
     );
@@ -334,9 +335,10 @@ fn install(
     let resource = home()?.join(format!("Library/LaunchAgents/{label}.plist"));
     let executable = current_exe()?;
     let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>schedule</string><string>run</string><string>--config</string><string>{}</string></array>\n<key>StartInterval</key><integer>{}</integer>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>schedule</string><string>run</string><string>--config</string><string>{}</string></array>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>\n<key>StartInterval</key><integer>{}</integer>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
         xml_escape(&executable.display().to_string()),
         xml_escape(&config_path.display().to_string()),
+        xml_escape(&scheduler_path()),
         scheduler_tick(config).as_secs()
     );
     write_owned(&resource, plist.as_bytes())?;
@@ -448,7 +450,8 @@ fn install(
     let wrapper = config_dir.join("schedule-run.ps1");
     let executable = current_exe()?;
     let script = format!(
-        "$ErrorActionPreference = 'Stop'\r\n& '{}' schedule run --config '{}'\r\n$code = $LASTEXITCODE\r\nif ($code -eq 1) {{ exit 0 }}\r\nexit $code\r\n",
+        "$ErrorActionPreference = 'Stop'\r\n$env:PATH = '{}'\r\n& '{}' schedule run --config '{}'\r\n$code = $LASTEXITCODE\r\nif ($code -eq 1) {{ exit 0 }}\r\nexit $code\r\n",
+        ps_quote(&scheduler_path()),
         ps_quote(&executable.display().to_string()),
         ps_quote(&config_path.display().to_string())
     );
@@ -660,6 +663,65 @@ fn home() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot resolve the user home directory".into())
 }
 
+/// The PATH to bake into the units we generate.
+///
+/// `schedule install` runs from a shell where `herdr` resolves -- that is how
+/// the user got here. The scheduled run does not: systemd hands a user unit a
+/// bare `/usr/local/sbin:...:/bin`, launchd is stricter still, and neither
+/// includes `~/.local/bin`, where the installer puts `herdr`. Every check then
+/// failed with `herdr status: could not run: No such file or directory`, while
+/// running the same command by hand still worked -- so the breakage was
+/// invisible exactly where anyone would look for it.
+///
+/// Carrying the installing shell's PATH forward puts the scheduled run in the
+/// same environment as the manual one. The directory holding our own
+/// executable leads, because `herdr` sitting beside `herdr-updater` is the
+/// layout the installer produces and the one entry we can be sure about.
+fn scheduler_path() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(exe) = current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir = dir.display().to_string();
+            if !dir.is_empty() {
+                parts.push(dir);
+            }
+        }
+    }
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let source = if inherited.trim().is_empty() {
+        default_path()
+    } else {
+        &inherited
+    };
+    for entry in source.split(PATH_SEP) {
+        if !entry.is_empty() && !parts.iter().any(|p| p == entry) {
+            parts.push(entry.to_string());
+        }
+    }
+    parts.join(PATH_SEP_STR)
+}
+
+/// PATH entry separator for the platform whose scheduler we are writing for.
+#[cfg(windows)]
+const PATH_SEP: char = ';';
+#[cfg(not(windows))]
+const PATH_SEP: char = ':';
+#[cfg(windows)]
+const PATH_SEP_STR: &str = ";";
+#[cfg(not(windows))]
+const PATH_SEP_STR: &str = ":";
+
+/// Last resort when the installing process itself has no PATH -- rare, but a
+/// unit with an empty PATH is strictly worse than one with a conventional guess.
+#[cfg(windows)]
+fn default_path() -> &'static str {
+    r"C:\Windows\system32;C:\Windows"
+}
+#[cfg(not(windows))]
+fn default_path() -> &'static str {
+    "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+}
+
 #[cfg(target_os = "linux")]
 fn systemd_quote(path: &Path) -> String {
     format!(
@@ -798,6 +860,41 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(scheduler_tick(&config), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn scheduler_path_leads_with_our_own_directory() {
+        // the installed layout is `herdr` beside `herdr-updater`, so the
+        // directory we run from is the one entry we can be sure about
+        let path = scheduler_path();
+        let exe = current_exe().expect("current exe");
+        let dir = exe.parent().expect("exe dir").display().to_string();
+        assert!(path.starts_with(&dir), "{path} should start with {dir}");
+    }
+
+    #[test]
+    fn scheduler_path_keeps_inherited_entries_without_duplicating_them() {
+        let path = scheduler_path();
+        for entry in std::env::var("PATH").unwrap_or_default().split(PATH_SEP) {
+            if entry.is_empty() {
+                continue;
+            }
+            assert!(
+                path.split(PATH_SEP).any(|p| p == entry),
+                "{entry} missing from {path}"
+            );
+        }
+        let mut seen: Vec<&str> = path.split(PATH_SEP).collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate entries in {path}");
+    }
+
+    #[test]
+    fn scheduler_path_is_never_empty() {
+        // a service manager may hand us no PATH at all; the unit still needs one
+        assert!(!scheduler_path().is_empty());
     }
 
     #[test]
