@@ -663,7 +663,6 @@ fn home() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot resolve the user home directory".into())
 }
 
-#[cfg(target_os = "linux")]
 /// The PATH to bake into the units we generate.
 ///
 /// `schedule install` runs from a shell where `herdr` resolves -- that is how
@@ -689,16 +688,41 @@ fn scheduler_path() -> String {
         }
     }
     let inherited = std::env::var("PATH").unwrap_or_default();
-    let fallback = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    let source = if inherited.trim().is_empty() { fallback } else { &inherited };
-    for entry in source.split(':') {
+    let source = if inherited.trim().is_empty() {
+        default_path()
+    } else {
+        &inherited
+    };
+    for entry in source.split(PATH_SEP) {
         if !entry.is_empty() && !parts.iter().any(|p| p == entry) {
             parts.push(entry.to_string());
         }
     }
-    parts.join(":")
+    parts.join(PATH_SEP_STR)
 }
 
+/// PATH entry separator for the platform whose scheduler we are writing for.
+#[cfg(windows)]
+const PATH_SEP: char = ';';
+#[cfg(not(windows))]
+const PATH_SEP: char = ':';
+#[cfg(windows)]
+const PATH_SEP_STR: &str = ";";
+#[cfg(not(windows))]
+const PATH_SEP_STR: &str = ":";
+
+/// Last resort when the installing process itself has no PATH -- rare, but a
+/// unit with an empty PATH is strictly worse than one with a conventional guess.
+#[cfg(windows)]
+fn default_path() -> &'static str {
+    r"C:\Windows\system32;C:\Windows"
+}
+#[cfg(not(windows))]
+fn default_path() -> &'static str {
+    "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+}
+
+#[cfg(target_os = "linux")]
 fn systemd_quote(path: &Path) -> String {
     format!(
         "\"{}\"",
@@ -851,13 +875,16 @@ mod tests {
     #[test]
     fn scheduler_path_keeps_inherited_entries_without_duplicating_them() {
         let path = scheduler_path();
-        for entry in std::env::var("PATH").unwrap_or_default().split(':') {
+        for entry in std::env::var("PATH").unwrap_or_default().split(PATH_SEP) {
             if entry.is_empty() {
                 continue;
             }
-            assert!(path.split(':').any(|p| p == entry), "{entry} missing from {path}");
+            assert!(
+                path.split(PATH_SEP).any(|p| p == entry),
+                "{entry} missing from {path}"
+            );
         }
-        let mut seen: Vec<&str> = path.split(':').collect();
+        let mut seen: Vec<&str> = path.split(PATH_SEP).collect();
         let before = seen.len();
         seen.sort_unstable();
         seen.dedup();
