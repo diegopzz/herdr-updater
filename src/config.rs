@@ -31,6 +31,7 @@ pub struct Config {
     pub require_fast_forward: bool,
     pub immutable_pins: bool,
     pub allow_protocol_change: bool,
+    pub allow_channel_mismatch: bool,
     pub allow: Vec<String>,
     pub trusted_owners: Vec<String>,
     pub max_concurrency: usize,
@@ -54,6 +55,7 @@ impl Default for Config {
             require_fast_forward: true,
             immutable_pins: true,
             allow_protocol_change: false,
+            allow_channel_mismatch: false,
             allow: Vec::new(),
             trusted_owners: Vec::new(),
             max_concurrency: 8,
@@ -66,6 +68,10 @@ pub struct Loaded {
     pub value: Config,
     pub path: PathBuf,
     pub existed: bool,
+    /// Non-fatal problems found while reading the file — today, keys this
+    /// build does not know. Carried rather than printed here so every command
+    /// surfaces them in its own format, including `--json`.
+    pub warnings: Vec<String>,
 }
 
 pub fn resolve_dir(herdr_bin: &str, timeout: Duration) -> PathBuf {
@@ -120,10 +126,12 @@ pub fn load(
                 value: Config::default(),
                 path,
                 existed: false,
+                warnings: Vec::new(),
             });
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
+    let warnings = inspect_keys(&text, &path)?;
     let mut value: Config =
         toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
     value.max_concurrency = value.max_concurrency.clamp(1, 32);
@@ -132,7 +140,114 @@ pub fn load(
         value,
         path,
         existed: true,
+        warnings,
     })
+}
+
+/// Every key this build understands, taken from the struct itself so the list
+/// cannot fall behind the fields.
+fn known_keys() -> Vec<String> {
+    match serde_json::to_value(Config::default()) {
+        Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Classify keys the config file declares that this build does not know.
+///
+/// serde's `default` attribute means an unrecognised key parses cleanly and is
+/// dropped, so `trusted_owner = ["diegopzz"]` silently means *no owner
+/// restriction at all* and `polciy = "auto"` silently means notify. A config
+/// that quietly does the opposite of what it says is the same class of failure
+/// as a check that quietly reports green.
+///
+/// The two cases are not the same, though, and treating them the same is why
+/// this is not simply `deny_unknown_fields`:
+///
+/// * A key that is *nearly* a known one is a typo. Nothing else explains it,
+///   the intended setting is not in effect, and refusing to run is the only
+///   answer that cannot be ignored.
+/// * A key that resembles nothing is most likely a setting from a newer build,
+///   read by an older one — which happens routinely on a fleet mid-rollout, and
+///   must not brick the older hosts. That warns.
+fn inspect_keys(text: &str, path: &Path) -> Result<Vec<String>, String> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        // A real parse error is reported by the typed parse, with a better
+        // message than anything this function could add.
+        return Ok(Vec::new());
+    };
+    let known = known_keys();
+    let mut warnings = Vec::new();
+    let mut typos = Vec::new();
+    for key in table.keys() {
+        if known.iter().any(|candidate| candidate == key) {
+            continue;
+        }
+        match nearest_key(key, &known) {
+            Some(suggestion) => typos.push(format!("{key:?} (did you mean {suggestion:?}?)")),
+            None => warnings.push(format!(
+                "{}: unknown setting {key:?} was ignored; it may belong to a newer herdr-updater",
+                path.display()
+            )),
+        }
+    }
+    if !typos.is_empty() {
+        return Err(format!(
+            "{}: {} looks like a misspelled setting and would be silently ignored: {}",
+            path.display(),
+            if typos.len() == 1 {
+                "this key"
+            } else {
+                "these keys"
+            },
+            typos.join(", ")
+        ));
+    }
+    Ok(warnings)
+}
+
+/// The closest known key within a small edit distance, or `None` when nothing
+/// is close enough for a typo to be the likely explanation.
+fn nearest_key(key: &str, known: &[String]) -> Option<String> {
+    // Case and separator slips are typos regardless of length.
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    if let Some(exact) = known.iter().find(|candidate| **candidate == normalized) {
+        return Some(exact.clone());
+    }
+    // Below four characters an edit distance of two is most of the word, so the
+    // "suggestion" would be noise.
+    if key.len() < 4 {
+        return None;
+    }
+    let tolerance = if key.len() <= 6 { 1 } else { 2 };
+    known
+        .iter()
+        .map(|candidate| (edit_distance(&normalized, candidate), candidate))
+        .filter(|(distance, _)| *distance <= tolerance)
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()))
+        .map(|(_, candidate)| candidate.clone())
+}
+
+/// Levenshtein distance over bytes, with a single rolling row. Config keys are
+/// ASCII and short, so this costs nothing worth measuring.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, l) in left.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, r) in right.iter().enumerate() {
+            let next = row[j + 1];
+            row[j + 1] = if l == r {
+                diagonal
+            } else {
+                1 + diagonal.min(row[j]).min(row[j + 1])
+            };
+            diagonal = next;
+        }
+    }
+    row[right.len()]
 }
 
 impl Config {
@@ -406,6 +521,76 @@ mod tests {
         assert_eq!(parse_quiet_hours("22:00-07:30").unwrap(), (1_320, 450));
         assert!(parse_quiet_hours("24:00-07:30").is_err());
         assert!(parse_quiet_hours("07:30-07:30").is_err());
+    }
+
+    fn temp_config(contents: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-updater-keys-{}-{unique}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn known_keys_are_taken_from_the_struct_itself() {
+        let keys = known_keys();
+        for expected in ["policy", "trusted_owners", "allow_channel_mismatch"] {
+            assert!(keys.iter().any(|key| key == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_setting_is_an_error_not_a_silent_default() {
+        // The failure this prevents: `trusted_owner` parses clean, and the
+        // owner restriction the operator wrote is simply not in effect.
+        let path = temp_config("trusted_owner = [\"diegopzz\"]\n");
+        let result = load(Some(&path), "herdr", Duration::from_secs(1));
+        let _ = std::fs::remove_file(&path);
+        let error = result.expect_err("a near-miss key must fail closed");
+        assert!(error.contains("trusted_owner"), "{error}");
+        assert!(error.contains("trusted_owners"), "{error}");
+    }
+
+    #[test]
+    fn a_key_from_a_newer_build_warns_instead_of_bricking_an_older_host() {
+        let path = temp_config("some_future_capability = true\n");
+        let result = load(Some(&path), "herdr", Duration::from_secs(1));
+        let _ = std::fs::remove_file(&path);
+        let loaded = result.expect("an unrecognisable key must not fail the run");
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("some_future_capability"));
+        assert_eq!(loaded.value.policy, Policy::Notify);
+    }
+
+    #[test]
+    fn a_valid_config_produces_no_warnings() {
+        let path = temp_config("policy = \"auto\"\ntrusted_owners = [\"diegopzz\"]\n");
+        let result = load(Some(&path), "herdr", Duration::from_secs(1));
+        let _ = std::fs::remove_file(&path);
+        let loaded = result.expect("a valid config must load");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.value.policy, Policy::Auto);
+    }
+
+    #[test]
+    fn case_and_separator_slips_are_treated_as_typos() {
+        assert_eq!(
+            nearest_key("Check-Interval", &known_keys()).as_deref(),
+            Some("check_interval")
+        );
+        assert_eq!(nearest_key("zzz", &known_keys()), None);
+    }
+
+    #[test]
+    fn edit_distance_matches_known_values() {
+        assert_eq!(edit_distance("policy", "policy"), 0);
+        assert_eq!(edit_distance("polciy", "policy"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
     }
 
     #[test]

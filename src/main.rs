@@ -14,6 +14,7 @@ mod history;
 mod plugins;
 mod schedule;
 mod sync;
+mod version;
 
 const USAGE: &str = "\
 herdr-updater -- keep Herdr core and plugins current without overwriting forks
@@ -194,21 +195,26 @@ struct Report {
     config_exists: bool,
     core: Option<CoreReport>,
     plugins: Vec<PluginReport>,
+    /// Non-fatal problems that would otherwise be invisible — an ignored
+    /// config key changes behaviour without changing any line of output.
+    warnings: Vec<String>,
     errors: Vec<String>,
 }
 
 fn core_action(state: &herdr::CoreState, cfg: &config::Config) -> Action {
-    match herdr::gate(state) {
+    match herdr::gate(state, cfg.allow_channel_mismatch) {
         Ok(()) if state.protocol_change && !cfg.allow_protocol_change => {
             Action::Hold("protocol change requires an explicit staged rollout".into())
         }
         Ok(()) if cfg.policy == config::Policy::Notify => Action::Hold("notify policy".into()),
         Ok(()) => Action::Update,
         Err(herdr::Hold::UpToDate) => Action::Current,
-        Err(herdr::Hold::NoLiveHandoff) => {
-            Action::Hold("running server cannot live-handoff".into())
-        }
+        // Two versions we cannot order is a failed check, not a quiet hold: it
+        // has to reach the exit code, or a machine running something we do not
+        // understand looks exactly like a machine that is current.
+        Err(hold @ herdr::Hold::Unorderable) => Action::Error(herdr::hold_text(&hold)),
         Err(herdr::Hold::Unknown(error)) => Action::Error(error),
+        Err(hold) => Action::Hold(herdr::hold_text(&hold)),
     }
 }
 
@@ -257,6 +263,7 @@ fn inspect(args: &Args, loaded: &config::Loaded) -> Report {
         config_exists: loaded.existed,
         core,
         plugins,
+        warnings: loaded.warnings.clone(),
         errors,
     }
 }
@@ -330,6 +337,7 @@ fn print_report(report: &Report, json: bool) {
                 .map(|protocol| format!(" (protocol {protocol})"))
                 .unwrap_or_default()
         );
+        println!("  relation   {:?}", core.state.relation);
         println!("  action     {}", action_text(&core.action));
     }
     if !report.plugins.is_empty() {
@@ -346,6 +354,9 @@ fn print_report(report: &Report, json: bool) {
                 action_text(&plugin.action)
             );
         }
+    }
+    for warning in &report.warnings {
+        println!("\nWARNING -- {warning}");
     }
     for error in &report.errors {
         println!("\nERROR -- {error}");
@@ -392,7 +403,12 @@ fn apply_report(args: &Args, loaded: &config::Loaded, startup: bool) -> i32 {
     if !startup {
         if let Some(core) = &report.core {
             if matches!(core.action, Action::Update) {
-                match herdr::apply(&bin, &core.state, mutation_timeout) {
+                match herdr::apply(
+                    &bin,
+                    &core.state,
+                    loaded.value.allow_channel_mismatch,
+                    mutation_timeout,
+                ) {
                     Ok(result) => {
                         let event = history::Event::new(
                             history::EventKind::CoreUpdated,
@@ -925,6 +941,8 @@ mod tests {
             restart_needed: false,
             latest: Some("0.9.0".into()),
             latest_protocol: Some(21),
+            relation: herdr::CoreRelation::Behind,
+            channel_mismatch: false,
             update_available: true,
             protocol_change: true,
             error: None,
