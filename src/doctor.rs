@@ -409,6 +409,24 @@ fn state_checks(config_dir: &Path, config: &Config) -> Vec<Check> {
     }
 
     let history_path = history::path(config_dir);
+    // An append-only audit log is meant to grow, so this is deliberately not a
+    // rotation. It is a heads-up: every command that reads history parses the
+    // whole file, and truncating an audit trail is a decision for a person.
+    const HISTORY_LARGE_BYTES: u64 = 4 * 1024 * 1024;
+    if let Ok(metadata) = std::fs::metadata(&history_path) {
+        if metadata.len() > HISTORY_LARGE_BYTES {
+            checks.push(warn(
+                "state",
+                "history size",
+                format!(
+                    "{} is {:.1} MiB; every read parses all of it",
+                    history_path.display(),
+                    metadata.len() as f64 / (1024.0 * 1024.0)
+                ),
+                "archive the file if you no longer need the older entries; it is append-only by design",
+            ));
+        }
+    }
     match history::read(&history_path) {
         Ok(events) => checks.push(ok(
             "state",

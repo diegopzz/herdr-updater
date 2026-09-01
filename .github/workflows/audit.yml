@@ -28,3 +28,16 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit the locked dependency tree
         run: cargo audit --deny warnings
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      # Licences and duplicate versions, which `cargo audit` does not cover.
+      # A binary people download and execute should not acquire a copyleft or
+      # unknown-licence dependency without somebody noticing.
+      - name: Check licences and bans
+        run: cargo deny check licenses bans
