@@ -7,7 +7,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if [ -x "$ROOT/target/release/herdr-updater" ]; then
     source_binary="$ROOT/target/release/herdr-updater"
 else
-    source_binary="$ROOT/bin/.cache/0.1.4/herdr-updater"
+    source_binary="$ROOT/bin/.cache/0.2.0/herdr-updater"
 fi
 destination_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
 mkdir -p "$destination_dir"

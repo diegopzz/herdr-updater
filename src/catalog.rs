@@ -19,7 +19,7 @@ const CACHE_FILE: &str = "marketplace-v1.json";
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPOSITORIES: usize = 5_000;
 const MAX_MANIFESTS_PER_REPOSITORY: usize = 100;
-const MAX_RESULTS: usize = 500;
+pub const MAX_RESULTS: usize = 500;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -982,7 +982,7 @@ fn current_platform() -> &'static str {
 }
 
 fn supports_current_platform(item: &CatalogItem) -> bool {
-    item.platforms.as_ref().map_or(true, |platforms| {
+    item.platforms.as_ref().is_none_or(|platforms| {
         platforms
             .iter()
             .any(|platform| platform == current_platform())

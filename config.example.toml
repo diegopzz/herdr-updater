@@ -27,8 +27,20 @@ immutable_pins = true
 # Core protocol changes need a staged fleet rollout or an explicit CLI flag.
 allow_protocol_change = false
 
+# herdr.dev/latest.json describes the stable channel. A client tracking any
+# other channel is compared against a manifest that does not describe it, which
+# is held. Set this only if you know latest.json covers your channel.
+allow_channel_mismatch = false
+
 # Empty means all GitHub sources are eligible. Narrow these for auto mode.
 # allow = ["diegopzz/herdr-*"]
 # trusted_owners = ["diegopzz"]
 
+# Parallel hosts during `fleet` and `sync`, and parallel plugin inspections.
 max_concurrency = 8
+
+# Unrecognised keys in this file are not silently ignored. A key close to a
+# real one (`trusted_owner`, `polciy`) is an error naming the key you meant,
+# because it would otherwise change the safety posture without changing a line
+# of output. A key resembling nothing known only warns, so a host running an
+# older build mid-rollout does not fail on a newer build's setting.

@@ -6,7 +6,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 mod catalog;
+mod clock;
 mod config;
+mod doctor;
 mod exec;
 mod fleet;
 mod herdr;
@@ -14,6 +16,7 @@ mod history;
 mod plugins;
 mod schedule;
 mod sync;
+mod version;
 
 const USAGE: &str = "\
 herdr-updater -- keep Herdr core and plugins current without overwriting forks
@@ -23,6 +26,7 @@ USAGE
 
 COMMANDS
     check       inspect core and plugins; never mutate
+    doctor      check this tool's own environment and report what is degraded
     plan        show the policy decision for every target; never mutate
     apply       execute safe UPDATE decisions when policy = \"auto\"
     update      alias for apply
@@ -49,7 +53,8 @@ OPTIONS
     --plugins-only              skip Herdr core inspection
     --allow-protocol-change     explicitly allow a local core protocol change
     --sort <mode>               marketplace: relevance, stars, trending, recent, name
-    --limit <count>             marketplace result limit (default 50, max 500)
+    --limit <count>             cap results: marketplace (default 50) or history entries
+    --since <duration>          history only: entries newer than 7d, 12h, 1h30m, ...
     --refresh                   refresh the marketplace cache before use
     -y, --yes                   confirm marketplace install or fleet reconciliation
     -h, --help                  show this text
@@ -74,9 +79,10 @@ struct Args {
     allow_protocol_change: bool,
     operands: Vec<String>,
     sort: catalog::SortMode,
-    limit: usize,
+    limit: Option<usize>,
     refresh: bool,
     yes: bool,
+    since: Option<Duration>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -96,9 +102,10 @@ fn parse() -> Result<Args, String> {
         allow_protocol_change: false,
         operands: Vec::new(),
         sort: catalog::SortMode::Relevance,
-        limit: 50,
+        limit: None,
         refresh: false,
         yes: false,
+        since: None,
     };
     let mut iter = raw.into_iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -136,12 +143,19 @@ fn parse() -> Result<Args, String> {
             }
             "--limit" => {
                 let value = iter.next().ok_or("--limit needs a value")?;
-                args.limit = value
+                let limit = value
                     .parse::<usize>()
                     .map_err(|_| format!("--limit: {value:?} is not a number"))?;
-                if args.limit == 0 || args.limit > 500 {
-                    return Err("--limit must be between 1 and 500".into());
+                if limit == 0 || limit > 100_000 {
+                    return Err("--limit must be between 1 and 100000".into());
                 }
+                args.limit = Some(limit);
+            }
+            "--since" => {
+                let value = iter.next().ok_or("--since needs a duration such as 7d")?;
+                args.since = Some(
+                    config::parse_duration(&value).map_err(|error| format!("--since: {error}"))?,
+                );
             }
             "--refresh" => args.refresh = true,
             "-y" | "--yes" => args.yes = true,
@@ -194,21 +208,26 @@ struct Report {
     config_exists: bool,
     core: Option<CoreReport>,
     plugins: Vec<PluginReport>,
+    /// Non-fatal problems that would otherwise be invisible — an ignored
+    /// config key changes behaviour without changing any line of output.
+    warnings: Vec<String>,
     errors: Vec<String>,
 }
 
 fn core_action(state: &herdr::CoreState, cfg: &config::Config) -> Action {
-    match herdr::gate(state) {
+    match herdr::gate(state, cfg.allow_channel_mismatch) {
         Ok(()) if state.protocol_change && !cfg.allow_protocol_change => {
             Action::Hold("protocol change requires an explicit staged rollout".into())
         }
         Ok(()) if cfg.policy == config::Policy::Notify => Action::Hold("notify policy".into()),
         Ok(()) => Action::Update,
         Err(herdr::Hold::UpToDate) => Action::Current,
-        Err(herdr::Hold::NoLiveHandoff) => {
-            Action::Hold("running server cannot live-handoff".into())
-        }
+        // Two versions we cannot order is a failed check, not a quiet hold: it
+        // has to reach the exit code, or a machine running something we do not
+        // understand looks exactly like a machine that is current.
+        Err(hold @ herdr::Hold::Unorderable) => Action::Error(herdr::hold_text(&hold)),
         Err(herdr::Hold::Unknown(error)) => Action::Error(error),
+        Err(hold) => Action::Hold(herdr::hold_text(&hold)),
     }
 }
 
@@ -257,6 +276,7 @@ fn inspect(args: &Args, loaded: &config::Loaded) -> Report {
         config_exists: loaded.existed,
         core,
         plugins,
+        warnings: loaded.warnings.clone(),
         errors,
     }
 }
@@ -330,6 +350,7 @@ fn print_report(report: &Report, json: bool) {
                 .map(|protocol| format!(" (protocol {protocol})"))
                 .unwrap_or_default()
         );
+        println!("  relation   {:?}", core.state.relation);
         println!("  action     {}", action_text(&core.action));
     }
     if !report.plugins.is_empty() {
@@ -346,6 +367,9 @@ fn print_report(report: &Report, json: bool) {
                 action_text(&plugin.action)
             );
         }
+    }
+    for warning in &report.warnings {
+        println!("\nWARNING -- {warning}");
     }
     for error in &report.errors {
         println!("\nERROR -- {error}");
@@ -392,7 +416,12 @@ fn apply_report(args: &Args, loaded: &config::Loaded, startup: bool) -> i32 {
     if !startup {
         if let Some(core) = &report.core {
             if matches!(core.action, Action::Update) {
-                match herdr::apply(&bin, &core.state, mutation_timeout) {
+                match herdr::apply(
+                    &bin,
+                    &core.state,
+                    loaded.value.allow_channel_mismatch,
+                    mutation_timeout,
+                ) {
                     Ok(result) => {
                         let event = history::Event::new(
                             history::EventKind::CoreUpdated,
@@ -488,31 +517,70 @@ fn print_history(args: &Args, loaded: &config::Loaded) -> i32 {
             .parent()
             .unwrap_or_else(|| std::path::Path::new(".")),
     );
-    match history::read(&path) {
+    let events = match history::read(&path) {
+        Ok(events) => events,
         Err(error) => {
             eprintln!("herdr-updater: {error}");
-            2
+            return 2;
         }
-        Ok(events) if args.json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&events).unwrap_or_else(|_| "[]".into())
-            );
-            0
-        }
-        Ok(events) => {
-            if events.is_empty() {
-                println!("no update history in {}", path.display());
-            }
-            for event in events {
-                println!(
-                    "{}  {:?}  {}  {} -> {}",
-                    event.unix_seconds, event.kind, event.target, event.previous, event.current
-                );
-            }
-            0
-        }
+    };
+    let total = events.len();
+    // Filters compose, and `--limit` is applied last so it always means "the
+    // most recent N of whatever survived the filters" rather than "the first N
+    // the file happens to contain".
+    let cutoff = args
+        .since
+        .map(|since| clock::now().saturating_sub(since.as_secs()));
+    let mut selected: Vec<&history::Event> = events
+        .iter()
+        .filter(|event| cutoff.is_none_or(|cutoff| event.unix_seconds >= cutoff))
+        .filter(|event| {
+            args.only
+                .as_ref()
+                .is_none_or(|target| &event.target == target)
+        })
+        .collect();
+    if let Some(limit) = args.limit {
+        let start = selected.len().saturating_sub(limit);
+        selected.drain(..start);
     }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&selected).unwrap_or_else(|_| "[]".into())
+        );
+        return 0;
+    }
+    if selected.is_empty() {
+        if total == 0 {
+            println!("no update history in {}", path.display());
+        } else {
+            println!("no matching entries in {} of {total}", selected.len());
+        }
+        return 0;
+    }
+    for event in &selected {
+        let short = |value: &str| {
+            if value.len() == 40 || value.len() == 64 {
+                value[..12].to_string()
+            } else {
+                value.to_string()
+            }
+        };
+        println!(
+            "{}  {:<18}  {:<24}  {} -> {}",
+            clock::format_unix(event.unix_seconds),
+            format!("{:?}", event.kind),
+            event.target,
+            short(&event.previous),
+            short(&event.current)
+        );
+    }
+    if selected.len() < total {
+        println!("\nshowing {} of {total} entries", selected.len());
+    }
+    0
 }
 
 fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32 {
@@ -532,7 +600,7 @@ fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32
     let latest = history::latest_plugins(&events);
     let mut candidates: Vec<_> = latest
         .values()
-        .filter(|event| args.only.as_ref().map_or(true, |id| id == &event.target))
+        .filter(|event| args.only.as_ref().is_none_or(|id| id == &event.target))
         .filter(|event| {
             if resume {
                 event.kind == history::EventKind::PluginRolledBack
@@ -778,10 +846,13 @@ fn run(args: &mut Args) -> i32 {
         println!("herdr-updater {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
-    if args.command == "fleet" {
-        return fleet::cmd_fleet(&args.hosts, args.timeout, args.json);
-    }
     let bin = herdr_bin();
+    if args.command == "doctor" {
+        // Deliberately ahead of the shared config load: a config that will not
+        // parse is the most likely reason somebody typed `doctor`, and exiting
+        // here would answer that with the same silence being diagnosed.
+        return doctor::run(args.config.as_deref(), &bin, args.json, args.timeout);
+    }
     let mut loaded = match config::load(args.config.as_deref(), &bin, args.timeout) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -797,6 +868,9 @@ fn run(args: &mut Args) -> i32 {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     match args.command.as_str() {
+        // Loaded after the config rather than before it, so `max_concurrency`
+        // and a bad config are both honoured here too.
+        "fleet" => fleet::cmd_fleet(&args.hosts, &loaded.value, args.timeout, args.json),
         "check" | "plan" => check_or_plan(args, &loaded),
         "apply" | "update" => apply_report(args, &loaded, false),
         "startup" if !loaded.value.startup_check => 0,
@@ -811,7 +885,7 @@ fn run(args: &mut Args) -> i32 {
                     query: &query,
                     json: args.json,
                     sort: args.sort,
-                    limit: args.limit,
+                    limit: args.limit.unwrap_or(50).min(catalog::MAX_RESULTS),
                     refresh: args.refresh,
                 },
                 config_dir,
@@ -925,6 +999,8 @@ mod tests {
             restart_needed: false,
             latest: Some("0.9.0".into()),
             latest_protocol: Some(21),
+            relation: herdr::CoreRelation::Behind,
+            channel_mismatch: false,
             update_available: true,
             protocol_change: true,
             error: None,

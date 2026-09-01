@@ -24,11 +24,17 @@ pub struct ScheduleState {
 }
 
 #[derive(Debug, Serialize)]
-struct Status {
-    platform: &'static str,
-    installed: bool,
-    resource: String,
-    state: ScheduleState,
+pub struct Status {
+    pub platform: &'static str,
+    pub installed: bool,
+    pub resource: String,
+    pub state: ScheduleState,
+}
+
+/// Read the scheduler state without touching it, for callers that report on
+/// the schedule rather than manage it.
+pub fn describe(config_dir: &Path) -> Result<Status, String> {
+    status(config_dir)
 }
 
 pub struct RunLease {
@@ -199,7 +205,10 @@ pub fn cmd_schedule(
                     status.resource
                 );
                 if let Some(next) = status.state.next_check_unix_seconds {
-                    println!("next check: unix {next}");
+                    println!("next check: {}", crate::clock::describe_unix(next));
+                }
+                if let Some(last) = status.state.last_success_unix_seconds {
+                    println!("last success: {}", crate::clock::describe_unix(last));
                 }
                 if status.state.consecutive_failures > 0 {
                     println!(

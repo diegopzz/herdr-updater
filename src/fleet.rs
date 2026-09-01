@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::exec;
 use crate::herdr;
 
@@ -300,11 +301,6 @@ pub(crate) fn probe_local(timeout: Duration) -> HostState {
     st
 }
 
-/// Fan out over hosts. Bounded so a large fleet cannot open an unbounded
-/// number of ssh connections at once; wall-clock cost stays roughly one round
-/// trip regardless of host count.
-const MAX_CONCURRENCY: usize = 8;
-
 /// Deliberately narrow about blast radius. An earlier draft of this warning
 /// said a protocol split stops mirrors working. That is wrong, and measuring
 /// it is what caught it: on 2026-08-30 a protocol 18 host mirrored cleanly
@@ -318,14 +314,15 @@ const SPLIT_WARNING: &str = "  \u{26a0} PROTOCOL SPLIT — hosts are on differen
     herdr binary, so both ends of that conversation already match.
     Update before relying on --remote, and close the drift regardless.";
 
-pub fn cmd_fleet(only: &[String], timeout: Duration, json: bool) -> i32 {
-    let (states, source) = collect_states(only, timeout);
+pub fn cmd_fleet(only: &[String], config: &Config, timeout: Duration, json: bool) -> i32 {
+    let (states, source) = collect_states(only, config.max_concurrency, timeout);
 
     render_fleet(states, source, json)
 }
 
 pub(crate) fn collect_states(
     only: &[String],
+    max_concurrency: usize,
     timeout: Duration,
 ) -> (Vec<HostState>, Option<PathBuf>) {
     let (mut hosts, source) = load_hosts();
@@ -336,7 +333,13 @@ pub(crate) fn collect_states(
     let (tx, rx) = mpsc::channel();
     let mut states = vec![probe_local(timeout)];
 
-    for chunk in hosts.chunks(MAX_CONCURRENCY) {
+    // Bounded so a large fleet cannot open an unbounded number of ssh
+    // connections at once; wall-clock cost stays roughly one round trip
+    // regardless of host count. The bound is `max_concurrency`, which
+    // `config.example.toml` has always documented and which this module used to
+    // ignore in favour of a hard-coded 8 — a setting that silently does nothing
+    // is worse than no setting at all.
+    for chunk in hosts.chunks(max_concurrency.max(1)) {
         let mut handles = Vec::new();
         for (name, target) in chunk {
             let (name, target, tx) = (name.clone(), target.clone(), tx.clone());

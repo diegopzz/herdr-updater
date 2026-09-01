@@ -32,3 +32,27 @@ jobs:
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # Read the version from the manifest rather than repeating it here, so
+      # the job cannot quietly test a different toolchain than the one the
+      # crate promises. A declared MSRV nobody runs is not a claim, it is a
+      # decoration — this one was wrong for months.
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install the declared toolchain
+        run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+      - name: Build and test on the declared MSRV
+        run: |
+          set -euo pipefail
+          cargo "+${{ steps.msrv.outputs.version }}" build --locked
+          cargo "+${{ steps.msrv.outputs.version }}" test --locked

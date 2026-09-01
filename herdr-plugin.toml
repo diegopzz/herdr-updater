@@ -1,6 +1,6 @@
 id = "herdr-updater"
 name = "Herdr Updater"
-version = "0.1.4"
+version = "0.2.0"
 min_herdr_version = "0.8.2"
 description = "Update Herdr safely with a plugin store, fleet sync, schedules, drift checks, and rollback"
 platforms = ["linux", "macos", "windows"]
@@ -41,6 +41,13 @@ title = "Apply safe Herdr and plugin updates"
 contexts = ["workspace"]
 platforms = ["linux", "macos"]
 command = ["sh", "bin/herdr-updater", "apply"]
+
+[[actions]]
+id = "doctor"
+title = "Diagnose the Herdr updater"
+contexts = ["workspace"]
+platforms = ["linux", "macos"]
+command = ["sh", "bin/herdr-updater", "doctor"]
 
 [[actions]]
 id = "fleet"
@@ -90,6 +97,13 @@ title = "Apply safe Herdr and plugin updates"
 contexts = ["workspace"]
 platforms = ["windows"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "apply"]
+
+[[actions]]
+id = "doctor-windows"
+title = "Diagnose the Herdr updater"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-updater.ps1", "doctor"]
 
 [[actions]]
 id = "fleet-windows"

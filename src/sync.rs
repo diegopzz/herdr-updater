@@ -10,6 +10,7 @@ use crate::exec;
 use crate::fleet::{self, FleetPlugin, HostState};
 use crate::history::{self, Event, EventKind};
 use crate::plugins;
+use crate::version;
 
 const DESIRED_FILE: &str = "desired.toml";
 const REMOTE_HERDR: &str = "if command -v herdr >/dev/null 2>&1; then H=herdr; elif [ -x \"$HOME/.local/bin/herdr\" ]; then H=\"$HOME/.local/bin/herdr\"; else echo NO_HERDR; exit 10; fi;";
@@ -273,7 +274,7 @@ pub fn plan(
     }
     let (desired, desired_exists, mut warnings) =
         load_or_derive(config_dir, config, herdr_bin, timeout)?;
-    let (states, host_source) = fleet::collect_states(hosts, timeout);
+    let (states, host_source) = fleet::collect_states(hosts, config.max_concurrency, timeout);
     if host_source.is_none() {
         warnings.push("no fleet hosts file was found".into());
     }
@@ -481,7 +482,7 @@ fn compatibility_hold(state: &HostState, plugin: &DesiredPlugin) -> Option<Strin
     let Some(minimum_text) = plugin.min_herdr_version.as_deref() else {
         return Some("desired plugin is missing min_herdr_version; re-export desired state".into());
     };
-    let Some(minimum) = parse_semver(minimum_text) else {
+    let Some(minimum) = version::parse(minimum_text) else {
         return Some(format!(
             "desired plugin declares invalid min_herdr_version {minimum_text:?}"
         ));
@@ -489,21 +490,11 @@ fn compatibility_hold(state: &HostState, plugin: &DesiredPlugin) -> Option<Strin
     let Some(current_text) = state.version.as_deref() else {
         return Some("remote Herdr version is unknown".into());
     };
-    let Some(current) = parse_semver(current_text) else {
+    let Some(current) = version::parse(current_text) else {
         return Some(format!("remote Herdr version {current_text:?} is invalid"));
     };
     (current < minimum)
         .then(|| format!("requires Herdr {minimum_text} or newer; remote has {current_text}"))
-}
-
-fn parse_semver(value: &str) -> Option<(u64, u64, u64)> {
-    let value = value.strip_prefix('v').unwrap_or(value);
-    let core = value.split(['-', '+']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    parts.next().is_none().then_some((major, minor, patch))
 }
 
 fn source_of(plugin: &FleetPlugin) -> Option<String> {
