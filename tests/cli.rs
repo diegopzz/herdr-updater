@@ -9,6 +9,17 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 const CURRENT_STATUS: &str = r#"{"client":{"version":"0.8.2","channel":"stable","protocol":20,"binary":"/fake/herdr"},"server":{"status":"running","running":true,"version":"0.8.2","protocol":20,"capabilities":{"live_handoff":true,"detached_server_daemon":true},"compatible":true,"restart_needed":false}}"#;
 
 fn run(args: &[&str], status: &str, latest: &str) -> Output {
+    run_seeded(args, status, latest, |_| {})
+}
+
+/// Same fixture, with a chance to write files into the config directory first
+/// — history and config-parsing behaviour is only observable that way.
+fn run_seeded(
+    args: &[&str],
+    status: &str,
+    latest: &str,
+    seed: impl FnOnce(&std::path::Path),
+) -> Output {
     let root = std::env::temp_dir().join(format!(
         "herdr-updater-cli-{}-{}",
         std::process::id(),
@@ -42,6 +53,8 @@ fi
     let curl = bin.join("curl");
     std::fs::write(&curl, "#!/bin/sh\nprintf '%s\\n' \"$TEST_LATEST\"\n").unwrap();
     std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    seed(&config);
 
     let path = format!("{}:/usr/bin:/bin", bin.display());
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-updater"))
@@ -173,6 +186,167 @@ fn invalid_marketplace_sort_is_a_usage_error() {
         r#"{"version":"0.8.2","protocol":20}"#,
     );
     assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn a_misspelled_config_key_fails_closed_instead_of_being_ignored() {
+    // `trusted_owner` parses clean under serde defaults and silently means no
+    // owner restriction at all, which is the opposite of what was written.
+    let output = run_seeded(
+        &["check", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+        |config| {
+            std::fs::write(
+                config.join("config.toml"),
+                "policy = \"auto\"\ntrusted_owner = [\"diegopzz\"]\n",
+            )
+            .unwrap();
+        },
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("trusted_owners"), "{stderr}");
+}
+
+#[test]
+fn an_unrecognised_config_key_warns_in_the_report_without_failing() {
+    let output = run_seeded(
+        &["check", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+        |config| {
+            std::fs::write(config.join("config.toml"), "future_setting = 3\n").unwrap();
+        },
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("future_setting")))));
+}
+
+#[test]
+fn a_core_version_ahead_of_the_manifest_is_held_not_applied() {
+    // policy = auto is the dangerous case: string inequality would have made
+    // this an UPDATE, and an UPDATE here is a downgrade.
+    let output = run_seeded(
+        &["plan", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.1","protocol":20}"#,
+        |config| {
+            std::fs::write(config.join("config.toml"), "policy = \"auto\"\n").unwrap();
+        },
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["core"]["state"]["relation"], "ahead");
+    assert_eq!(json["core"]["state"]["update_available"], false);
+    assert_eq!(json["core"]["action"]["action"], "hold");
+    assert!(json["core"]["action"]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("downgrade")));
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn an_unparseable_core_version_is_an_error_not_a_green_check() {
+    let status = CURRENT_STATUS.replace(r#""version":"0.8.2""#, r#""version":"nightly""#);
+    let output = run(
+        &["check", "--json"],
+        &status,
+        r#"{"version":"0.9.0","protocol":20}"#,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["core"]["state"]["relation"], "unknown");
+    assert_eq!(json["core"]["action"]["action"], "error");
+}
+
+#[test]
+fn history_filters_compose_and_limit_keeps_the_most_recent() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let output = run_seeded(
+        &["history", "--json", "--limit", "2"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+        |config| {
+            let lines: Vec<String> = (0..5)
+                .map(|index| {
+                    format!(
+                        r#"{{"unix_seconds":{},"kind":"plugin_updated","target":"p{index}","previous":"a","current":"b"}}"#,
+                        now - 100 + index
+                    )
+                })
+                .collect();
+            std::fs::write(config.join("state.jsonl"), lines.join("\n") + "\n").unwrap();
+        },
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let events = json.as_array().expect("history array");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["target"], "p3");
+    assert_eq!(events[1]["target"], "p4");
+}
+
+#[test]
+fn history_since_excludes_older_entries() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let output = run_seeded(
+        &["history", "--json", "--since", "1h"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+        |config| {
+            let old = now - 7 * 24 * 60 * 60;
+            let recent = now - 60;
+            std::fs::write(
+                config.join("state.jsonl"),
+                format!(
+                    "{{\"unix_seconds\":{old},\"kind\":\"plugin_updated\",\"target\":\"old\",\"previous\":\"a\",\"current\":\"b\"}}\n                     {{\"unix_seconds\":{recent},\"kind\":\"plugin_updated\",\"target\":\"new\",\"previous\":\"a\",\"current\":\"b\"}}\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let events = json.as_array().expect("history array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["target"], "new");
+}
+
+#[test]
+fn doctor_reports_every_area_and_never_panics_on_a_broken_config() {
+    let output = run_seeded(
+        &["doctor", "--json"],
+        CURRENT_STATUS,
+        r#"{"version":"0.8.2","protocol":20}"#,
+        |config| {
+            std::fs::write(config.join("config.toml"), "trusted_owner = [\"x\"]\n").unwrap();
+        },
+    );
+    // A config that will not load is exactly why somebody runs doctor, so it
+    // must report and continue rather than abort at the first check.
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = json["checks"].as_array().expect("doctor checks");
+    assert!(json["failures"].as_u64().unwrap() >= 1);
+    for area in ["config", "herdr", "tools", "state", "fleet"] {
+        assert!(
+            checks.iter().any(|check| check["area"] == area),
+            "doctor did not report the {area} area"
+        );
+    }
+    assert!(checks
+        .iter()
+        .any(|check| check["level"] == "fail" && check["area"] == "config"));
 }
 
 fn write_executable(path: &std::path::Path, contents: &str) {

@@ -6,7 +6,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 mod catalog;
+mod clock;
 mod config;
+mod doctor;
 mod exec;
 mod fleet;
 mod herdr;
@@ -24,6 +26,7 @@ USAGE
 
 COMMANDS
     check       inspect core and plugins; never mutate
+    doctor      check this tool's own environment and report what is degraded
     plan        show the policy decision for every target; never mutate
     apply       execute safe UPDATE decisions when policy = \"auto\"
     update      alias for apply
@@ -50,7 +53,8 @@ OPTIONS
     --plugins-only              skip Herdr core inspection
     --allow-protocol-change     explicitly allow a local core protocol change
     --sort <mode>               marketplace: relevance, stars, trending, recent, name
-    --limit <count>             marketplace result limit (default 50, max 500)
+    --limit <count>             cap results: marketplace (default 50) or history entries
+    --since <duration>          history only: entries newer than 7d, 12h, 1h30m, ...
     --refresh                   refresh the marketplace cache before use
     -y, --yes                   confirm marketplace install or fleet reconciliation
     -h, --help                  show this text
@@ -75,9 +79,10 @@ struct Args {
     allow_protocol_change: bool,
     operands: Vec<String>,
     sort: catalog::SortMode,
-    limit: usize,
+    limit: Option<usize>,
     refresh: bool,
     yes: bool,
+    since: Option<Duration>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -97,9 +102,10 @@ fn parse() -> Result<Args, String> {
         allow_protocol_change: false,
         operands: Vec::new(),
         sort: catalog::SortMode::Relevance,
-        limit: 50,
+        limit: None,
         refresh: false,
         yes: false,
+        since: None,
     };
     let mut iter = raw.into_iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -137,12 +143,19 @@ fn parse() -> Result<Args, String> {
             }
             "--limit" => {
                 let value = iter.next().ok_or("--limit needs a value")?;
-                args.limit = value
+                let limit = value
                     .parse::<usize>()
                     .map_err(|_| format!("--limit: {value:?} is not a number"))?;
-                if args.limit == 0 || args.limit > 500 {
-                    return Err("--limit must be between 1 and 500".into());
+                if limit == 0 || limit > 100_000 {
+                    return Err("--limit must be between 1 and 100000".into());
                 }
+                args.limit = Some(limit);
+            }
+            "--since" => {
+                let value = iter.next().ok_or("--since needs a duration such as 7d")?;
+                args.since = Some(
+                    config::parse_duration(&value).map_err(|error| format!("--since: {error}"))?,
+                );
             }
             "--refresh" => args.refresh = true,
             "-y" | "--yes" => args.yes = true,
@@ -504,31 +517,70 @@ fn print_history(args: &Args, loaded: &config::Loaded) -> i32 {
             .parent()
             .unwrap_or_else(|| std::path::Path::new(".")),
     );
-    match history::read(&path) {
+    let events = match history::read(&path) {
+        Ok(events) => events,
         Err(error) => {
             eprintln!("herdr-updater: {error}");
-            2
+            return 2;
         }
-        Ok(events) if args.json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&events).unwrap_or_else(|_| "[]".into())
-            );
-            0
-        }
-        Ok(events) => {
-            if events.is_empty() {
-                println!("no update history in {}", path.display());
-            }
-            for event in events {
-                println!(
-                    "{}  {:?}  {}  {} -> {}",
-                    event.unix_seconds, event.kind, event.target, event.previous, event.current
-                );
-            }
-            0
-        }
+    };
+    let total = events.len();
+    // Filters compose, and `--limit` is applied last so it always means "the
+    // most recent N of whatever survived the filters" rather than "the first N
+    // the file happens to contain".
+    let cutoff = args
+        .since
+        .map(|since| clock::now().saturating_sub(since.as_secs()));
+    let mut selected: Vec<&history::Event> = events
+        .iter()
+        .filter(|event| cutoff.map_or(true, |cutoff| event.unix_seconds >= cutoff))
+        .filter(|event| {
+            args.only
+                .as_ref()
+                .map_or(true, |target| &event.target == target)
+        })
+        .collect();
+    if let Some(limit) = args.limit {
+        let start = selected.len().saturating_sub(limit);
+        selected.drain(..start);
     }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&selected).unwrap_or_else(|_| "[]".into())
+        );
+        return 0;
+    }
+    if selected.is_empty() {
+        if total == 0 {
+            println!("no update history in {}", path.display());
+        } else {
+            println!("no matching entries in {} of {total}", selected.len());
+        }
+        return 0;
+    }
+    for event in &selected {
+        let short = |value: &str| {
+            if value.len() == 40 || value.len() == 64 {
+                value[..12].to_string()
+            } else {
+                value.to_string()
+            }
+        };
+        println!(
+            "{}  {:<18}  {:<24}  {} -> {}",
+            clock::format_unix(event.unix_seconds),
+            format!("{:?}", event.kind),
+            event.target,
+            short(&event.previous),
+            short(&event.current)
+        );
+    }
+    if selected.len() < total {
+        println!("\nshowing {} of {total} entries", selected.len());
+    }
+    0
 }
 
 fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32 {
@@ -795,6 +847,12 @@ fn run(args: &mut Args) -> i32 {
         return 0;
     }
     let bin = herdr_bin();
+    if args.command == "doctor" {
+        // Deliberately ahead of the shared config load: a config that will not
+        // parse is the most likely reason somebody typed `doctor`, and exiting
+        // here would answer that with the same silence being diagnosed.
+        return doctor::run(args.config.as_deref(), &bin, args.json, args.timeout);
+    }
     let mut loaded = match config::load(args.config.as_deref(), &bin, args.timeout) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -827,7 +885,7 @@ fn run(args: &mut Args) -> i32 {
                     query: &query,
                     json: args.json,
                     sort: args.sort,
-                    limit: args.limit,
+                    limit: args.limit.unwrap_or(50).min(catalog::MAX_RESULTS),
                     refresh: args.refresh,
                 },
                 config_dir,
