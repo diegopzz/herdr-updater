@@ -171,6 +171,11 @@ fn process_alive(pid: u32) -> Option<bool> {
 
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> Option<bool> {
+    // Windows has no dependency-free liveness probe that is also
+    // locale-independent — `tasklist` reports "no tasks match" in the system
+    // language — and a check that wrongly answers "dead" would let two runs
+    // mutate plugins at once. Unknown keeps the age fallback, which is the
+    // behaviour Windows already had.
     None
 }
 
@@ -1008,12 +1013,25 @@ mod tests {
         )
         .unwrap();
 
-        let lease = begin(&dir).expect("begin must not error").expect(
-            "a lock owned by a dead process must be reclaimed immediately, not after 2 hours",
-        );
-        drop(lease);
-        // Drop must leave nothing behind, owner file included.
-        assert!(!lock.exists(), "lock survived the lease");
+        let acquired = begin(&dir).expect("begin must not error");
+        if cfg!(unix) {
+            let lease = acquired.expect(
+                "a lock owned by a dead process must be reclaimed immediately, not after 2 hours",
+            );
+            drop(lease);
+            // Drop must leave nothing behind, owner file included.
+            assert!(!lock.exists(), "lock survived the lease");
+        } else {
+            // Windows has no dependency-free way to prove a PID is gone that is
+            // also locale-independent, and a liveness check that wrongly says
+            // "dead" would let two runs mutate plugins at once. So the verdict
+            // stays Unknown there and the age fallback remains the only
+            // recovery — the old behaviour, no worse, and honest about it.
+            assert!(
+                acquired.is_none(),
+                "without provable liveness the age check must remain the decider"
+            );
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
