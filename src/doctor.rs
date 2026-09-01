@@ -306,34 +306,43 @@ fn tool_checks() -> Vec<Check> {
         .collect()
 }
 
+fn gh_rate_limit(timeout: Duration) -> Option<String> {
+    exec::have("gh")
+        .then(|| exec::run("gh", &["api", "rate_limit"], timeout).ok())
+        .flatten()
+        .filter(exec::Output::ok)
+        .map(|out| out.stdout)
+}
+
+fn curl_rate_limit(timeout: Duration) -> Option<String> {
+    if !exec::have("curl") {
+        return None;
+    }
+    let seconds = timeout.as_secs().max(1).to_string();
+    exec::run(
+        "curl",
+        &[
+            "-fsSL",
+            "--max-time",
+            &seconds,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "https://api.github.com/rate_limit",
+        ],
+        timeout,
+    )
+    .ok()
+    .filter(exec::Output::ok)
+    .map(|out| out.stdout)
+}
+
 /// How much GitHub API budget is left, because running out is the most common
 /// reason a plugin check turns unknown and the least obvious to diagnose.
 fn github_budget(timeout: Duration) -> Vec<Check> {
-    let response = if exec::have("gh") {
-        exec::run("gh", &["api", "rate_limit"], timeout)
-            .ok()
-            .filter(exec::Output::ok)
-            .map(|out| out.stdout)
-    } else if exec::have("curl") {
-        let seconds = timeout.as_secs().max(1).to_string();
-        exec::run(
-            "curl",
-            &[
-                "-fsSL",
-                "--max-time",
-                &seconds,
-                "-H",
-                "Accept: application/vnd.github+json",
-                "https://api.github.com/rate_limit",
-            ],
-            timeout,
-        )
-        .ok()
-        .filter(exec::Output::ok)
-        .map(|out| out.stdout)
-    } else {
-        None
-    };
+    // `gh` first for the authenticated budget, then curl — including when gh
+    // is installed but unauthenticated, which fails here and would otherwise
+    // report "budget could not be read" on a machine whose budget is readable.
+    let response = gh_rate_limit(timeout).or_else(|| curl_rate_limit(timeout));
     let Some(response) = response else {
         return vec![warn(
             "github",

@@ -291,13 +291,20 @@ fn compare(
             if code == Some(200) {
                 let value: serde_json::Value = serde_json::from_str(body)
                     .map_err(|e| format!("GitHub compare response is not JSON: {e}"))?;
-                if let Some(relation) = value
+                return match value
                     .get("status")
                     .and_then(serde_json::Value::as_str)
                     .and_then(relation_from_status)
                 {
-                    return Ok(relation);
-                }
+                    Some(relation) => Ok(relation),
+                    // A 200 whose body says something we do not recognise is a
+                    // different problem from a 200 we never got, and saying
+                    // "returned HTTP 200" as if that were the fault sends the
+                    // reader to check a network that is working fine.
+                    None => {
+                        Err("GitHub compare succeeded but reported no recognisable status".into())
+                    }
+                };
             }
             if let Some(code) = code {
                 return Err(format!("GitHub compare returned HTTP {code}"));
