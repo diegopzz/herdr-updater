@@ -409,6 +409,24 @@ fn state_checks(config_dir: &Path, config: &Config) -> Vec<Check> {
     }
 
     let history_path = history::path(config_dir);
+    // An append-only audit log is meant to grow, so this is deliberately not a
+    // rotation. It is a heads-up: every command that reads history parses the
+    // whole file, and truncating an audit trail is a decision for a person.
+    const HISTORY_LARGE_BYTES: u64 = 4 * 1024 * 1024;
+    if let Ok(metadata) = std::fs::metadata(&history_path) {
+        if metadata.len() > HISTORY_LARGE_BYTES {
+            checks.push(warn(
+                "state",
+                "history size",
+                format!(
+                    "{} is {:.1} MiB; every read parses all of it",
+                    history_path.display(),
+                    metadata.len() as f64 / (1024.0 * 1024.0)
+                ),
+                "archive the file if you no longer need the older entries; it is append-only by design",
+            ));
+        }
+    }
     match history::read(&history_path) {
         Ok(events) => checks.push(ok(
             "state",
@@ -474,20 +492,73 @@ fn state_checks(config_dir: &Path, config: &Config) -> Vec<Check> {
                 ));
             }
             if status.state.consecutive_failures > 0 {
-                checks.push(warn(
-                    "schedule",
-                    "failures",
-                    format!(
-                        "{} consecutive failures, last exit code {}",
-                        status.state.consecutive_failures,
-                        status
-                            .state
-                            .last_exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "unknown".into())
+                let detail = format!(
+                    "{} consecutive failures, last exit code {}",
+                    status.state.consecutive_failures,
+                    status
+                        .state
+                        .last_exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                );
+                // Never having succeeded is a different claim from having
+                // failed a few times, and a much stronger one: unattended
+                // updates have not worked on this host once, ever. Found on
+                // two machines whose scheduler could not resolve `herdr` and
+                // so could never install the release that fixed it — the
+                // broken thing was the thing that would have repaired it.
+                checks.push(if status.state.last_success_unix_seconds.is_none() {
+                    fail(
+                        "schedule",
+                        "failures",
+                        format!("{detail}; no scheduled run has ever succeeded"),
+                        "run `herdr-updater schedule run` by hand to see the failure, then `schedule install` to regenerate the unit",
+                    )
+                } else {
+                    warn(
+                        "schedule",
+                        "failures",
+                        detail,
+                        "run `herdr-updater schedule run` by hand to see the failure",
+                    )
+                });
+            }
+            // A lock whose owner is gone blocks every run until it is
+            // reclaimed. `begin` now reclaims it automatically, so seeing one
+            // here means the platform could not prove liveness and the
+            // two-hour timeout is the only thing that will clear it.
+            if let Some(lock) = schedule::describe_lock(config_dir) {
+                let held = lock
+                    .held_for
+                    .map(|held| clock::humanize(held.as_secs()))
+                    .unwrap_or_else(|| "unknown".into());
+                let owner = lock
+                    .pid
+                    .map(|pid| format!("pid {pid}"))
+                    .unwrap_or_else(|| "an unrecorded owner".into());
+                checks.push(match lock.verdict {
+                    schedule::LockVerdict::OwnerGone => fail(
+                        "schedule",
+                        "lock",
+                        format!(
+                            "held for {held} by {owner}, which is gone; scheduled runs are blocked"
+                        ),
+                        "remove the schedule.lock directory in the state directory above",
                     ),
-                    "run `herdr-updater schedule run` by hand to see the failure",
-                ));
+                    schedule::LockVerdict::Unknown
+                        if lock.held_for.is_some_and(|h| h.as_secs() > 1_800) =>
+                    {
+                        warn(
+                            "schedule",
+                            "lock",
+                            format!(
+                                "held for {held} by {owner}, and liveness cannot be checked here"
+                            ),
+                            "if no check is really running, remove the schedule.lock directory",
+                        )
+                    }
+                    _ => ok("schedule", "lock", format!("held for {held} by {owner}")),
+                });
             }
         }
         Err(error) => checks.push(warn(

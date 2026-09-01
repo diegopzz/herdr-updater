@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Version = "0.2.0"
+$Version = "0.3.0"
 $Repository = "diegopzz/herdr-updater"
 $Root = Split-Path -Parent $PSScriptRoot
 $DevBinary = Join-Path $Root "target\release\herdr-updater.exe"
@@ -9,11 +9,16 @@ if (Test-Path -LiteralPath $DevBinary) {
     exit $LASTEXITCODE
 }
 
-if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
-    [Console]::Error.WriteLine("herdr-updater: no prebuilt Windows binary for this architecture")
+$Arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+if ($Arch -ne [Runtime.InteropServices.Architecture]::X64 -and
+    $Arch -ne [Runtime.InteropServices.Architecture]::Arm64) {
+    [Console]::Error.WriteLine("herdr-updater: no prebuilt Windows binary for $Arch")
     exit 2
 }
 
+# There is no native aarch64-pc-windows-msvc artifact yet, and Windows on ARM
+# runs x64 binaries under emulation. Refusing outright left ARM Windows with no
+# updater at all, which is a worse answer than a slightly slower one.
 $Target = "x86_64-pc-windows-msvc"
 $Asset = "herdr-updater-$Version-$Target.tar.gz"
 $Checksums = "checksums-$Version.txt"

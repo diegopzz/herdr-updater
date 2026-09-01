@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::exec;
 use crate::herdr;
+use crate::version;
 
 /// Hosts come from our own config if present, otherwise from herdr-mirror's —
 /// which most people who need this tool already maintain. Sharing that file
@@ -391,12 +392,46 @@ fn render_fleet(states: Vec<HostState>, source: Option<PathBuf>, json: bool) -> 
         .map(str::to_string)
         .collect();
 
+    // "version_split: true" says the fleet disagrees. It does not say which
+    // machine to go and fix, which is the only question anyone actually has in
+    // front of this report. Now that versions can be ordered, name the newest
+    // one present and list the hosts behind it.
+    let newest = states
+        .iter()
+        .filter_map(|state| state.version.as_deref())
+        .filter_map(|value| version::parse(value).map(|parsed| (parsed, value)))
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, value)| value.to_string());
+    let behind: Vec<String> = match newest.as_deref() {
+        Some(newest) => states
+            .iter()
+            .filter(|state| {
+                state.version.as_deref().is_some_and(|value| {
+                    matches!(
+                        version::compare(value, newest),
+                        Some(std::cmp::Ordering::Less)
+                    )
+                })
+            })
+            .map(|state| {
+                format!(
+                    "{} ({})",
+                    state.host,
+                    state.version.as_deref().unwrap_or("?")
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     if json {
         let doc = serde_json::json!({
             "config": source.as_ref().map(|p| p.display().to_string()),
             "hosts": states,
             "protocol_split": protocol_split,
             "version_split": version_split,
+            "newest_version": newest,
+            "hosts_behind": behind,
             "unreachable": unreachable,
             "plugin_inventory_unknown": plugin_unknown,
             "plugin_drift": plugin_drift,
@@ -457,7 +492,21 @@ fn render_fleet(states: Vec<HostState>, source: Option<PathBuf>, json: bool) -> 
                 "  version drift, but the protocol matches on every host we could read —\n    \
                  mirrors and --remote keep working; update at your convenience."
             );
-        } else if unreachable == 0 {
+        }
+        // Printed under either split, because "which machine is behind" is the
+        // question in both cases and the protocol warning does not answer it.
+        if !behind.is_empty() {
+            println!(
+                "  newest is {}; behind: {}",
+                newest.as_deref().unwrap_or("unknown"),
+                behind.join(", ")
+            );
+        } else if version_split {
+            println!(
+                "  no host is strictly behind another — the versions differ but cannot be ordered."
+            );
+        }
+        if !protocol_split && !version_split && unreachable == 0 {
             println!("  fleet agrees: one version, one protocol.");
         }
         if unreachable > 0 {
@@ -509,6 +558,46 @@ mod tests {
             f.hosts["macbook"].target, None,
             "absent target means: use the key"
         );
+    }
+
+    #[test]
+    fn the_newest_version_and_the_hosts_behind_it_are_named() {
+        // "version_split: true" never said which machine to go and fix.
+        fn host(name: &str, version: &str) -> HostState {
+            HostState {
+                host: name.into(),
+                target: name.into(),
+                local: false,
+                version: Some(version.into()),
+                protocol: Some(20),
+                server_running: true,
+                plugins: BTreeMap::new(),
+                plugin_error: None,
+                error: None,
+            }
+        }
+        let states = [host("a", "0.9.0"), host("b", "0.8.2"), host("c", "0.10.0")];
+        let newest = states
+            .iter()
+            .filter_map(|state| state.version.as_deref())
+            .filter_map(|value| version::parse(value).map(|parsed| (parsed, value)))
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, value)| value.to_string());
+        // 0.10.0 beats 0.9.0 by ordering; string comparison would pick 0.9.0.
+        assert_eq!(newest.as_deref(), Some("0.10.0"));
+        let behind: Vec<&str> = states
+            .iter()
+            .filter(|state| {
+                state.version.as_deref().is_some_and(|value| {
+                    matches!(
+                        version::compare(value, newest.as_deref().unwrap()),
+                        Some(std::cmp::Ordering::Less)
+                    )
+                })
+            })
+            .map(|state| state.host.as_str())
+            .collect();
+        assert_eq!(behind, vec!["a", "b"]);
     }
 
     #[test]
