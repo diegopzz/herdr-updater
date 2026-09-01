@@ -9,6 +9,17 @@ use crate::exec;
 
 const STATE_FILE: &str = "schedule-state.json";
 const LOCK_DIR: &str = "schedule.lock";
+const LOCK_OWNER_FILE: &str = "owner.json";
+/// Last-resort reclaim age, used only when ownership cannot be *proved* dead.
+///
+/// It used to be the only recovery path, and that was the whole bug: a run
+/// killed by a signal never reaches `Drop`, so the lock directory outlived it
+/// and every subsequent run reported "another scheduled check is already
+/// running" and exited 0 for two full hours. Observed on vspc-wsl 2026-09-01 —
+/// a SIGTERM at 09:18:45, then ~25 consecutive no-op runs, then the first real
+/// check at 11:20:40, exactly one staleness window later. A scheduler that is
+/// installed, firing, and reporting success while doing nothing is the precise
+/// failure this crate exists to prevent.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 const MIN_SCHEDULER_TICK: Duration = Duration::from_secs(60);
 const MAX_SCHEDULER_TICK: Duration = Duration::from_secs(5 * 60);
@@ -37,6 +48,32 @@ pub fn describe(config_dir: &Path) -> Result<Status, String> {
     status(config_dir)
 }
 
+/// What the lock looks like right now, for reporting rather than acquiring.
+#[derive(Debug, Clone)]
+pub struct LockReport {
+    pub verdict: LockVerdict,
+    pub pid: Option<u32>,
+    pub held_for: Option<Duration>,
+}
+
+/// Describe the lock without touching it. `None` when no run holds one.
+pub fn describe_lock(config_dir: &Path) -> Option<LockReport> {
+    let lock = config_dir.join(LOCK_DIR);
+    if !fs::symlink_metadata(&lock).is_ok_and(|m| m.file_type().is_dir()) {
+        return None;
+    }
+    let owner = read_owner(&lock);
+    let held_for = fs::symlink_metadata(&lock)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    Some(LockReport {
+        verdict: inspect_owner(owner.as_ref()),
+        pid: owner.as_ref().map(|owner| owner.pid),
+        held_for,
+    })
+}
+
 pub struct RunLease {
     lock: PathBuf,
     state_path: PathBuf,
@@ -63,8 +100,115 @@ impl StateBackup {
 
 impl Drop for RunLease {
     fn drop(&mut self) {
+        // The owner file lives inside the directory, so the directory is no
+        // longer empty and `remove_dir` alone would leave the lock behind.
+        let _ = fs::remove_file(self.lock.join(LOCK_OWNER_FILE));
         let _ = fs::remove_dir(&self.lock);
     }
+}
+
+/// Who holds the lock, written inside it so a later run can ask whether that
+/// process still exists instead of only asking how old the directory is.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LockOwner {
+    pub pid: u32,
+    /// Distinguishes boots, so a PID reused after a reboot is not mistaken for
+    /// the original holder. `None` where the platform does not expose one.
+    #[serde(default)]
+    pub boot: Option<String>,
+    pub acquired_unix_seconds: u64,
+}
+
+/// What we could establish about the current holder of the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockVerdict {
+    /// A live process holds it; a concurrent run is genuinely in progress.
+    Held,
+    /// The recorded owner is provably gone. Reclaim immediately.
+    OwnerGone,
+    /// Ownership is unknowable here, so only age can decide.
+    Unknown,
+}
+
+fn boot_id() -> Option<String> {
+    // Linux exposes one directly. Elsewhere we simply have no boot identity and
+    // fall back to PID liveness alone, which is still far better than waiting
+    // out a two-hour timeout.
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Is `pid` still running?
+///
+/// `Some(false)` is the only answer that authorises reclaiming a lock, so every
+/// uncertain case must return `None` and let the age check decide. Guessing
+/// "dead" wrongly would let two runs mutate plugins at once.
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> Option<bool> {
+    if pid == 0 {
+        return Some(false); // never a valid holder
+    }
+    // /proc is authoritative and needs no subprocess.
+    Some(Path::new(&format!("/proc/{pid}")).exists())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_alive(pid: u32) -> Option<bool> {
+    if pid == 0 {
+        return Some(false);
+    }
+    // `kill -0` reports liveness without signalling. Exit 0 means alive; a
+    // non-zero exit means gone — "not ours" cannot happen for a lock this
+    // same user wrote.
+    let pid = pid.to_string();
+    match exec::run("kill", &["-0", &pid], Duration::from_secs(5)) {
+        Ok(output) => Some(output.ok()),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
+fn read_owner(lock: &Path) -> Option<LockOwner> {
+    let bytes = read_optional_state_bytes(&lock.join(LOCK_OWNER_FILE)).ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Decide whether the holder is still alive, from the owner file alone.
+pub(crate) fn inspect_owner(owner: Option<&LockOwner>) -> LockVerdict {
+    // No owner file: written by a build that predates ownership, so all we can
+    // do is fall back to age.
+    let Some(owner) = owner else {
+        return LockVerdict::Unknown;
+    };
+    // A different boot means the holder cannot exist, whatever its PID says
+    // today — and PIDs are recycled aggressively after a reboot.
+    if let (Some(recorded), Some(current)) = (owner.boot.as_deref(), boot_id()) {
+        if recorded != current {
+            return LockVerdict::OwnerGone;
+        }
+    }
+    match process_alive(owner.pid) {
+        Some(true) => LockVerdict::Held,
+        Some(false) => LockVerdict::OwnerGone,
+        None => LockVerdict::Unknown,
+    }
+}
+
+fn write_owner(lock: &Path) -> Result<(), String> {
+    let owner = LockOwner {
+        pid: std::process::id(),
+        boot: boot_id(),
+        acquired_unix_seconds: now(),
+    };
+    let bytes =
+        serde_json::to_vec(&owner).map_err(|error| format!("cannot encode lock owner: {error}"))?;
+    write_owned(&lock.join(LOCK_OWNER_FILE), &bytes)
 }
 
 impl RunLease {
@@ -130,14 +274,22 @@ pub fn begin(config_dir: &Path) -> Result<Option<RunLease>, String> {
                     lock.display()
                 ));
             }
-            let stale = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .is_some_and(|age| age >= LOCK_STALE_AFTER);
-            if !stale {
+            // Ask who holds it before asking how old it is. A run killed by a
+            // signal leaves this directory behind with no chance to clean up,
+            // and age alone cannot tell that apart from a run still working.
+            let reclaim = match inspect_owner(read_owner(&lock).as_ref()) {
+                LockVerdict::Held => return Ok(None),
+                LockVerdict::OwnerGone => true,
+                LockVerdict::Unknown => metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age >= LOCK_STALE_AFTER),
+            };
+            if !reclaim {
                 return Ok(None);
             }
+            let _ = fs::remove_file(lock.join(LOCK_OWNER_FILE));
             fs::remove_dir(&lock)
                 .map_err(|error| format!("cannot clear stale {}: {error}", lock.display()))?;
             fs::create_dir(&lock)
@@ -145,6 +297,9 @@ pub fn begin(config_dir: &Path) -> Result<Option<RunLease>, String> {
         }
         Err(error) => return Err(format!("cannot acquire {}: {error}", lock.display())),
     }
+    // Best-effort: a lock without an owner file still works, it just falls back
+    // to the age check, so a write failure here must not abort the run.
+    let _ = write_owner(&lock);
     let state_path = config_dir.join(STATE_FILE);
     let state = read_state(&state_path)?;
     Ok(Some(RunLease {
@@ -820,6 +975,101 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-updater-lock-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_process_is_reclaimed_without_waiting() {
+        // The regression this exists for: a run killed by a signal never
+        // reaches Drop, and every later run used to report "already running"
+        // and exit 0 for two hours. PID 0 can never be a live holder.
+        let dir = scratch("dead");
+        let lock = dir.join(LOCK_DIR);
+        fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            pid: 0,
+            boot: boot_id(),
+            acquired_unix_seconds: now(),
+        };
+        fs::write(
+            lock.join(LOCK_OWNER_FILE),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+
+        let lease = begin(&dir).expect("begin must not error").expect(
+            "a lock owned by a dead process must be reclaimed immediately, not after 2 hours",
+        );
+        drop(lease);
+        // Drop must leave nothing behind, owner file included.
+        assert!(!lock.exists(), "lock survived the lease");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_lock_held_by_a_live_process_is_respected() {
+        let dir = scratch("live");
+        let lock = dir.join(LOCK_DIR);
+        fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            pid: std::process::id(), // this test is alive by definition
+            boot: boot_id(),
+            acquired_unix_seconds: now(),
+        };
+        fs::write(
+            lock.join(LOCK_OWNER_FILE),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            begin(&dir).unwrap().is_none(),
+            "a genuinely concurrent run must still be refused"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_lock_from_a_previous_boot_is_gone_whatever_its_pid_says() {
+        // PIDs are recycled aggressively across a reboot, so a live PID today
+        // says nothing about a holder recorded before the machine restarted.
+        let owner = LockOwner {
+            pid: std::process::id(),
+            boot: Some("00000000-0000-0000-0000-000000000000".into()),
+            acquired_unix_seconds: now(),
+        };
+        if boot_id().is_some() {
+            assert_eq!(inspect_owner(Some(&owner)), LockVerdict::OwnerGone);
+        }
+    }
+
+    #[test]
+    fn a_lock_with_no_owner_file_falls_back_to_age() {
+        // Written by a build that predates ownership: unknowable, so the age
+        // check must remain the decider rather than a guess either way.
+        assert_eq!(inspect_owner(None), LockVerdict::Unknown);
+    }
+
+    #[test]
+    fn acquiring_records_this_process_as_the_owner() {
+        let dir = scratch("owner");
+        let lease = begin(&dir).unwrap().expect("free lock must be acquirable");
+        let recorded = read_owner(&dir.join(LOCK_DIR)).expect("owner file must be written");
+        assert_eq!(recorded.pid, std::process::id());
+        assert_eq!(recorded.boot, boot_id());
+        drop(lease);
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn quiet_hours_support_windows_that_cross_midnight() {
