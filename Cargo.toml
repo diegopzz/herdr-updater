@@ -1,6 +1,6 @@
 [package]
 name = "herdr-updater"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 # Verified by the MSRV job in CI, not asserted. 1.74 was declared and never
 # checked; it has not built since a transitive dependency moved to edition

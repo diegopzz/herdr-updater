@@ -349,6 +349,29 @@ fn doctor_reports_every_area_and_never_panics_on_a_broken_config() {
         .any(|check| check["level"] == "fail" && check["area"] == "config"));
 }
 
+/// The version is written in seven places and the launcher downloads
+/// `v$VERSION` release assets by name, so a file left behind does not fail at
+/// build time — it fails on somebody else's machine, at install time, with a
+/// 404 for an asset that was never published.
+#[test]
+fn every_file_that_carries_the_version_agrees_with_the_manifest() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let version = env!("CARGO_PKG_VERSION");
+    for (file, needle) in [
+        ("herdr-plugin.toml", format!("version = \"{version}\"")),
+        ("bin/herdr-updater", format!("VERSION=\"{version}\"")),
+        ("bin/herdr-updater.ps1", format!("$Version = \"{version}\"")),
+        ("scripts/install-cli.sh", format!("/{version}/")),
+        ("scripts/install-cli.ps1", format!("\\{version}\\")),
+    ] {
+        let contents = std::fs::read_to_string(root.join(file)).unwrap();
+        assert!(
+            contents.contains(&needle),
+            "{file} does not carry version {version} (looked for {needle:?})"
+        );
+    }
+}
+
 fn write_executable(path: &std::path::Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
