@@ -35,6 +35,7 @@ pub struct Config {
     pub allow: Vec<String>,
     pub trusted_owners: Vec<String>,
     pub max_concurrency: usize,
+    pub ref_cache_ttl: String,
 }
 
 impl Default for Config {
@@ -59,6 +60,10 @@ impl Default for Config {
             allow: Vec::new(),
             trusted_owners: Vec::new(),
             max_concurrency: 8,
+            // Short on purpose: this is the only cached value that can go
+            // stale, and its worst case is a delayed update, never a wrong
+            // one. "0s" disables ref caching entirely.
+            ref_cache_ttl: "15m".into(),
         }
     }
 }
@@ -269,6 +274,15 @@ impl Config {
 
     pub fn jitter_value(&self) -> Duration {
         parse_duration(&self.jitter).unwrap_or(Duration::from_secs(5 * 60))
+    }
+
+    /// Seconds a resolved ref may be reused. Unparseable falls back to the
+    /// default rather than to "forever".
+    pub fn ref_cache_seconds(&self) -> u64 {
+        parse_duration(&self.ref_cache_ttl)
+            .unwrap_or(Duration::from_secs(15 * 60))
+            .as_secs()
+            .min(6 * 60 * 60)
     }
 
     pub fn target_allowed(&self, owner: &str, repo: &str) -> bool {

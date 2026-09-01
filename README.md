@@ -123,6 +123,7 @@ herdr plugin action list --plugin herdr-updater
 | `rollback` | Reinstall a plugin at its pre-update commit and pin it there. |
 | `resume` | Return a rolled-back plugin to its recorded branch/default ref. |
 | `startup` | Check on Herdr startup; in `auto`, update plugins but never core. |
+| `completions` | Print a shell completion script for bash, zsh, or fish. |
 
 Common options:
 
@@ -338,6 +339,39 @@ herdr-updater history --since 7d
 herdr-updater history --only herdr-mirror --limit 5
 ```
 
+## Caching
+
+Two different network answers are cached, and only one of them can go stale.
+
+A **commit comparison** is a pure function of two immutable SHAs — GitHub cannot
+change the ancestry between two fixed commits — so its answer is kept
+indefinitely. This is also the expensive one: it is the call that spends the
+API budget, one request per GitHub-sourced plugin per check.
+
+A **resolved ref** is time-varying, because a branch tip moves. It is bounded by
+`ref_cache_ttl` (default `15m`, `"0s"` disables), and re-resolved
+unconditionally by `--refresh` and by every command that is about to change
+something — `apply`, `rollback`, and `resume` never act on a cached ref. The
+worst case a stale ref can produce is a *delayed* update, never a wrong one,
+because the apply path re-resolves and verifies the commit it actually
+installed.
+
+On a machine with six plugins this takes a warm `check` from ~1.8s to ~0.2s and
+returns identical verdicts.
+
+## Shell completions
+
+```sh
+herdr-updater completions bash > /etc/bash_completion.d/herdr-updater
+herdr-updater completions zsh  > "${fpath[1]}/_herdr-updater"
+herdr-updater completions fish > ~/.config/fish/completions/herdr-updater.fish
+```
+
+The scripts are generated from one list, and a test asserts in both directions
+that it matches the commands and flags in `--help` — so a flag added to the CLI
+without a completion entry fails the build rather than shipping a script that
+quietly describes an older tool.
+
 ## Roadmap status
 
 - [x] Safe Herdr core and plugin update planning and application.
@@ -353,6 +387,8 @@ herdr-updater history --only herdr-mirror --limit 5
 - [x] Signed build provenance for every release artifact.
 - [x] Version-ordered core updates that refuse to downgrade.
 - [x] `doctor` preflight for the updater's own environment.
+- [x] Permanent commit-comparison cache and a bounded, bypassable ref cache.
+- [x] Generated shell completions that cannot drift from the CLI.
 
 ## Development
 

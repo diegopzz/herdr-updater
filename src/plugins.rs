@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::exec;
+use crate::refcache::{self, RefCache};
 
 #[derive(Debug, Clone, Deserialize)]
 struct PluginListEnvelope {
@@ -58,6 +59,34 @@ pub enum Channel {
     Unmanaged,
 }
 
+impl Channel {
+    /// Stable spelling for the cache. Deliberately hand-written rather than
+    /// derived from serde: a cache file outlives a rename, and an unknown
+    /// spelling must be a miss rather than a wrong answer.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Channel::DefaultBranch => "default_branch",
+            Channel::Branch => "branch",
+            Channel::Tag => "tag",
+            Channel::Commit => "commit",
+            Channel::Linked => "linked",
+            Channel::Unmanaged => "unmanaged",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default_branch" => Some(Channel::DefaultBranch),
+            "branch" => Some(Channel::Branch),
+            "tag" => Some(Channel::Tag),
+            "commit" => Some(Channel::Commit),
+            "linked" => Some(Channel::Linked),
+            "unmanaged" => Some(Channel::Unmanaged),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Relation {
@@ -74,6 +103,33 @@ pub enum Relation {
     RateLimited,
     Unknown,
     NotApplicable,
+}
+
+impl Relation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Relation::Same => "same",
+            Relation::Behind => "behind",
+            Relation::Ahead => "ahead",
+            Relation::Diverged => "diverged",
+            Relation::RateLimited => "rate_limited",
+            Relation::Unknown => "unknown",
+            Relation::NotApplicable => "not_applicable",
+        }
+    }
+
+    /// Only the three permanent verdicts are readable back from cache.
+    /// `RateLimited` and `Unknown` describe a moment, not a commit pair, and
+    /// caching either would turn a transient failure into a sticky one.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "same" => Some(Relation::Same),
+            "behind" => Some(Relation::Behind),
+            "ahead" => Some(Relation::Ahead),
+            "diverged" => Some(Relation::Diverged),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,10 +226,22 @@ fn resolve_remote(
     repo: &str,
     requested_ref: Option<&str>,
     installed: &str,
+    cache: &RefCache,
     timeout: Duration,
 ) -> Result<(String, Channel), String> {
     if requested_ref.is_some_and(full_commit) {
         return Ok((installed.to_ascii_lowercase(), Channel::Commit));
+    }
+    // A cached ref carries the channel it resolved as, because "which sha" and
+    // "was that a branch or a tag" are answered by the same lookup and a hit
+    // must not lose half of it.
+    let key = refcache::ref_key(owner, repo, requested_ref);
+    if let Some(cached) = cache.remote_ref(&key) {
+        if let Some((sha, channel)) = cached.split_once(' ') {
+            if let Some(channel) = Channel::parse(channel) {
+                return Ok((sha.to_string(), channel));
+            }
+        }
     }
     let url = format!("https://github.com/{owner}/{repo}.git");
     if let Some(reference) = requested_ref.filter(|value| !value.is_empty()) {
@@ -200,8 +268,14 @@ fn resolve_remote(
             (Some(_), Some(_)) => Err(format!(
                 "ref {reference:?} is both a branch and tag; pin an exact commit"
             )),
-            (Some(sha), None) => Ok((sha, Channel::Branch)),
-            (None, Some(sha)) => Ok((sha, Channel::Tag)),
+            (Some(sha), None) => {
+                cache.store_remote_ref(&key, &format!("{sha} {}", Channel::Branch.as_str()));
+                Ok((sha, Channel::Branch))
+            }
+            (None, Some(sha)) => {
+                cache.store_remote_ref(&key, &format!("{sha} {}", Channel::Tag.as_str()));
+                Ok((sha, Channel::Tag))
+            }
             (None, None) => Err(format!("upstream ref {reference:?} does not exist")),
         };
     }
@@ -216,7 +290,10 @@ fn resolve_remote(
         ));
     }
     ref_sha(&out.stdout, "HEAD")
-        .map(|sha| (sha, Channel::DefaultBranch))
+        .map(|sha| {
+            cache.store_remote_ref(&key, &format!("{sha} {}", Channel::DefaultBranch.as_str()));
+            (sha, Channel::DefaultBranch)
+        })
         .ok_or_else(|| "upstream default branch did not resolve to a commit".to_string())
 }
 
@@ -236,6 +313,7 @@ fn compare(
     repo: &str,
     installed: &str,
     remote: &str,
+    cache: &RefCache,
     timeout: Duration,
 ) -> Result<Relation, String> {
     if installed.eq_ignore_ascii_case(remote) {
@@ -244,6 +322,15 @@ fn compare(
     if !full_commit(installed) || !full_commit(remote) {
         return Err("installed or remote revision is not a full commit SHA".into());
     }
+    // Both ends are immutable commits, so this answer cannot go stale and is
+    // reused regardless of TTL or --refresh. It is also the call that spends
+    // the GitHub budget, one request per plugin per check.
+    let compare_key = refcache::compare_key(owner, repo, installed, remote);
+    if let Some(cached) = cache.compare(&compare_key) {
+        if let Some(relation) = Relation::parse(&cached) {
+            return Ok(relation);
+        }
+    }
     let endpoint = format!("repos/{owner}/{repo}/compare/{installed}...{remote}");
     let mut rate_limited = false;
     if exec::have("gh") {
@@ -251,6 +338,7 @@ fn compare(
             .map_err(|e| format!("GitHub compare: {e}"))?;
         if out.ok() {
             if let Some(relation) = relation_from_status(out.trimmed()) {
+                cache.store_compare(&compare_key, relation.as_str());
                 return Ok(relation);
             }
         } else {
@@ -296,7 +384,10 @@ fn compare(
                     .and_then(serde_json::Value::as_str)
                     .and_then(relation_from_status)
                 {
-                    Some(relation) => Ok(relation),
+                    Some(relation) => {
+                        cache.store_compare(&compare_key, relation.as_str());
+                        Ok(relation)
+                    }
                     // A 200 whose body says something we do not recognise is a
                     // different problem from a 200 we never got, and saying
                     // "returned HTTP 200" as if that were the fault sends the
@@ -333,7 +424,7 @@ fn mentions_rate_limit(text: &str) -> bool {
     text.contains("rate limit") || text.contains("secondary rate") || text.contains("api limit")
 }
 
-fn inspect_one(plugin: InstalledPlugin, timeout: Duration) -> PluginState {
+fn inspect_one(plugin: InstalledPlugin, cache: &RefCache, timeout: Duration) -> PluginState {
     let mut state = PluginState {
         plugin_id: plugin.plugin_id,
         version: plugin.version,
@@ -393,12 +484,13 @@ fn inspect_one(plugin: InstalledPlugin, timeout: Duration) -> PluginState {
         repo,
         source.requested_ref.as_deref(),
         installed,
+        cache,
         timeout,
     ) {
         Ok((remote, channel)) => {
             state.remote_sha = Some(remote.clone());
             state.channel = channel;
-            match compare(owner, repo, installed, &remote, timeout) {
+            match compare(owner, repo, installed, &remote, cache, timeout) {
                 Ok(relation) => {
                     state.relation = relation;
                     state.update_available = relation == Relation::Behind;
@@ -421,6 +513,7 @@ pub fn inspect_all(
     herdr_bin: &str,
     config: &Config,
     only: Option<&str>,
+    cache: &Arc<RefCache>,
     timeout: Duration,
 ) -> Result<Vec<PluginState>, String> {
     let mut installed = list_installed(herdr_bin, timeout)?;
@@ -437,8 +530,9 @@ pub fn inspect_all(
         let mut handles = Vec::with_capacity(chunk.len());
         for plugin in chunk.iter().cloned() {
             let tx = tx.clone();
+            let cache = Arc::clone(cache);
             handles.push(thread::spawn(move || {
-                let _ = tx.send(inspect_one(plugin, timeout));
+                let _ = tx.send(inspect_one(plugin, &cache, timeout));
             }));
         }
         for handle in handles {

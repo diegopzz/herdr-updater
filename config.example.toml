@@ -39,6 +39,14 @@ allow_channel_mismatch = false
 # Parallel hosts during `fleet` and `sync`, and parallel plugin inspections.
 max_concurrency = 8
 
+# How long a resolved branch/tag may be reused before it is looked up again.
+# Only this half of the cache can go stale, and its worst case is a *delayed*
+# update, never a wrong one: `apply`, `rollback`, `resume`, and `--refresh` all
+# re-resolve unconditionally. Commit-to-commit comparisons are cached
+# separately and never expire, because the ancestry between two immutable SHAs
+# cannot change. Set "0s" to disable ref caching entirely.
+ref_cache_ttl = "15m"
+
 # Unrecognised keys in this file are not silently ignored. A key close to a
 # real one (`trusted_owner`, `polciy`) is an error naming the key you meant,
 # because it would otherwise change the safety posture without changing a line

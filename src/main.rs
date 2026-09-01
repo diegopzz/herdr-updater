@@ -7,6 +7,7 @@ use serde::Serialize;
 
 mod catalog;
 mod clock;
+mod completions;
 mod config;
 mod doctor;
 mod exec;
@@ -14,11 +15,12 @@ mod fleet;
 mod herdr;
 mod history;
 mod plugins;
+mod refcache;
 mod schedule;
 mod sync;
 mod version;
 
-const USAGE: &str = "\
+pub const USAGE: &str = "\
 herdr-updater -- keep Herdr core and plugins current without overwriting forks
 
 USAGE
@@ -41,6 +43,7 @@ COMMANDS
     rollback    pin plugin(s) to the revision before their latest update
     resume      move rolled-back plugin(s) back to their recorded tracking ref
     startup     startup hook; check by default, auto-update plugins only if opted in
+    completions print a shell completion script for bash, zsh, or fish
     version     print this tool's version
 
 OPTIONS
@@ -244,7 +247,29 @@ fn plugin_action(state: &plugins::PluginState, cfg: &config::Config) -> Action {
 }
 
 fn inspect(args: &Args, loaded: &config::Loaded) -> Report {
+    inspect_with(args, loaded, refcache::Mode::Use)
+}
+
+/// `Fresh` is demanded by anything about to mutate, and by `--refresh`. Only
+/// the time-varying half of the cache is affected; commit comparisons are
+/// immutable and stay live either way.
+fn inspect_with(args: &Args, loaded: &config::Loaded, mode: refcache::Mode) -> Report {
     let bin = herdr_bin();
+    let config_dir = loaded
+        .path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let mode = if args.refresh {
+        refcache::Mode::Fresh
+    } else {
+        mode
+    };
+    let cache = std::sync::Arc::new(refcache::RefCache::load(
+        &config_dir,
+        mode,
+        loaded.value.ref_cache_seconds(),
+    ));
     let inspect_core = loaded.value.check_core && !args.plugins_only && args.only.is_none();
     let inspect_plugins = loaded.value.check_plugins && !args.core_only;
     let core = inspect_core.then(|| {
@@ -254,7 +279,13 @@ fn inspect(args: &Args, loaded: &config::Loaded) -> Report {
     });
     let mut errors = Vec::new();
     let plugins = if inspect_plugins {
-        match plugins::inspect_all(&bin, &loaded.value, args.only.as_deref(), args.timeout) {
+        match plugins::inspect_all(
+            &bin,
+            &loaded.value,
+            args.only.as_deref(),
+            &cache,
+            args.timeout,
+        ) {
             Ok(states) => states
                 .into_iter()
                 .map(|state| {
@@ -270,6 +301,7 @@ fn inspect(args: &Args, loaded: &config::Loaded) -> Report {
     } else {
         Vec::new()
     };
+    cache.persist(&config_dir);
     Report {
         policy: loaded.value.policy,
         config_path: loaded.path.display().to_string(),
@@ -389,7 +421,8 @@ fn check_or_plan(args: &Args, loaded: &config::Loaded) -> i32 {
 }
 
 fn apply_report(args: &Args, loaded: &config::Loaded, startup: bool) -> i32 {
-    let report = inspect(args, loaded);
+    // A mutation must never act on a ref someone resolved fifteen minutes ago.
+    let report = inspect_with(args, loaded, refcache::Mode::Fresh);
     if has_errors(&report) {
         print_report(&report, args.json);
         return 2;
@@ -617,21 +650,28 @@ fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32
     }
 
     let mutation_timeout = args.timeout.max(Duration::from_secs(120));
+    // Rollback and resume are mutations: never reuse a cached ref here.
+    let fresh_cache = std::sync::Arc::new(refcache::RefCache::disabled());
     let mut failures = Vec::new();
     let mut applied = Vec::new();
     for event in candidates {
-        let inspected =
-            match plugins::inspect_all(&bin, &loaded.value, Some(&event.target), args.timeout) {
-                Ok(mut states) if states.len() == 1 => states.remove(0),
-                Ok(_) => {
-                    failures.push(format!("{}: installed state is ambiguous", event.target));
-                    continue;
-                }
-                Err(error) => {
-                    failures.push(format!("{}: {error}", event.target));
-                    continue;
-                }
-            };
+        let inspected = match plugins::inspect_all(
+            &bin,
+            &loaded.value,
+            Some(&event.target),
+            &fresh_cache,
+            args.timeout,
+        ) {
+            Ok(mut states) if states.len() == 1 => states.remove(0),
+            Ok(_) => {
+                failures.push(format!("{}: installed state is ambiguous", event.target));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("{}: {error}", event.target));
+                continue;
+            }
+        };
         let (reference, kind, expected, tracking_ref) = if resume {
             (
                 event.tracking_ref.as_deref(),
@@ -657,6 +697,7 @@ fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32
                         &bin,
                         &loaded.value,
                         Some(&event.target),
+                        &fresh_cache,
                         args.timeout,
                     )?;
                     after
@@ -950,6 +991,19 @@ fn run(args: &mut Args) -> i32 {
                     args.json,
                     args.timeout,
                 )
+            }
+        }
+        "completions" => {
+            let shell = args.operands.first().map(String::as_str).unwrap_or("");
+            match completions::render(shell) {
+                Ok(script) => {
+                    print!("{script}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("herdr-updater: {error}");
+                    3
+                }
             }
         }
         "config-fingerprint" => {
