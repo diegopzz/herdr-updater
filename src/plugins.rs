@@ -65,6 +65,13 @@ pub enum Relation {
     Behind,
     Ahead,
     Diverged,
+    /// GitHub refused to answer because the API budget is spent. Distinct from
+    /// `Unknown` because the remedy is specific and the wait is finite: with
+    /// `gh` unauthenticated the fallback gets 60 requests an hour for the whole
+    /// machine, and one inspection costs one request per plugin. Reported as an
+    /// error, not a quiet hold, so a fleet does not read as current the moment
+    /// it grows past the budget.
+    RateLimited,
     Unknown,
     NotApplicable,
 }
@@ -238,6 +245,7 @@ fn compare(
         return Err("installed or remote revision is not a full commit SHA".into());
     }
     let endpoint = format!("repos/{owner}/{repo}/compare/{installed}...{remote}");
+    let mut rate_limited = false;
     if exec::have("gh") {
         let out = exec::run("gh", &["api", &endpoint, "--jq", ".status"], timeout)
             .map_err(|e| format!("GitHub compare: {e}"))?;
@@ -245,38 +253,77 @@ fn compare(
             if let Some(relation) = relation_from_status(out.trimmed()) {
                 return Ok(relation);
             }
+        } else {
+            rate_limited |= mentions_rate_limit(&out.stderr) || mentions_rate_limit(&out.stdout);
         }
     }
 
     if exec::have("curl") {
         let url = format!("https://api.github.com/{endpoint}");
         let max_time = timeout.as_secs().max(1).to_string();
+        let agent = concat!("User-Agent: herdr-updater/", env!("CARGO_PKG_VERSION"));
+        // `-f` is deliberately absent: it collapses every HTTP error into exit
+        // 22 and discards the body, which is precisely the information needed
+        // to tell "rate limited, try again in 40 minutes" from "we have no idea
+        // what happened".
         let out = exec::run(
             "curl",
             &[
-                "-fsSL",
+                "-sSL",
                 "--max-time",
                 &max_time,
                 "-H",
                 "Accept: application/vnd.github+json",
+                "-H",
+                agent,
+                "-w",
+                "\n%{http_code}",
                 &url,
             ],
             timeout,
         )
         .map_err(|e| format!("GitHub compare fallback: {e}"))?;
         if out.ok() {
-            let value: serde_json::Value = serde_json::from_str(&out.stdout)
-                .map_err(|e| format!("GitHub compare response is not JSON: {e}"))?;
-            if let Some(relation) = value
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .and_then(relation_from_status)
-            {
-                return Ok(relation);
+            let (body, code) = split_status(&out.stdout);
+            if matches!(code, Some(403) | Some(429)) && mentions_rate_limit(body) {
+                return Ok(Relation::RateLimited);
+            }
+            if code == Some(200) {
+                let value: serde_json::Value = serde_json::from_str(body)
+                    .map_err(|e| format!("GitHub compare response is not JSON: {e}"))?;
+                if let Some(relation) = value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(relation_from_status)
+                {
+                    return Ok(relation);
+                }
+            }
+            if let Some(code) = code {
+                return Err(format!("GitHub compare returned HTTP {code}"));
             }
         }
     }
+    if rate_limited {
+        return Ok(Relation::RateLimited);
+    }
     Err("could not classify the commit relationship with gh or curl".into())
+}
+
+/// Split a `curl -w '\n%{http_code}'` response into its body and status.
+fn split_status(response: &str) -> (&str, Option<u16>) {
+    match response.trim_end().rsplit_once('\n') {
+        Some((body, code)) => (body, code.trim().parse().ok()),
+        // A body-less response is all status and no body.
+        None => ("", response.trim().parse().ok()),
+    }
+}
+
+/// GitHub words its budget refusals a few ways — primary limit, secondary
+/// limit, and abuse detection — and all three mean "wait", not "unknown".
+fn mentions_rate_limit(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("rate limit") || text.contains("secondary rate") || text.contains("api limit")
 }
 
 fn inspect_one(plugin: InstalledPlugin, timeout: Duration) -> PluginState {
@@ -425,6 +472,9 @@ pub fn decide(state: &PluginState, config: &Config) -> Decision {
         }
         Relation::Ahead => Decision::Hold("local checkout is ahead of upstream".into()),
         Relation::Diverged => Decision::Hold("local and upstream histories diverged".into()),
+        Relation::RateLimited => Decision::Error(
+            "GitHub API rate limit reached; authenticate gh for a higher budget".into(),
+        ),
         Relation::Unknown => Decision::Error("commit relationship is unknown".into()),
         Relation::NotApplicable => Decision::Current,
     }
@@ -608,6 +658,38 @@ mod tests {
         assert!(valid_ref("release/v1.2"));
         assert!(!valid_ref("-oProxyCommand=bad"));
         assert!(!valid_ref("main..evil"));
+    }
+
+    #[test]
+    fn a_spent_api_budget_is_reported_as_rate_limited_not_as_no_update() {
+        // Exit code matters here: a hold would read as green and a whole fleet
+        // would look current the moment it outgrew 60 requests an hour.
+        assert!(matches!(
+            decide(
+                &state(Channel::Branch, Relation::RateLimited),
+                &Config::default()
+            ),
+            Decision::Error(reason) if reason.contains("rate limit")
+        ));
+    }
+
+    #[test]
+    fn rate_limit_wording_covers_every_shape_github_uses() {
+        assert!(mentions_rate_limit("API rate limit exceeded for 1.2.3.4"));
+        assert!(mentions_rate_limit(
+            "You have exceeded a secondary rate limit"
+        ));
+        assert!(!mentions_rate_limit("Not Found"));
+    }
+
+    #[test]
+    fn a_status_suffixed_response_splits_into_body_and_code() {
+        assert_eq!(
+            split_status("{\"status\":\"ahead\"}\n200"),
+            ("{\"status\":\"ahead\"}", Some(200))
+        );
+        assert_eq!(split_status("403").1, Some(403));
+        assert_eq!(split_status("no status here").1, None);
     }
 
     #[test]

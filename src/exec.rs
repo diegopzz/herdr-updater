@@ -12,9 +12,11 @@
 //!    is killed and the call reports `Timeout`, which callers degrade to
 //!    "unknown" rather than "up to date" — the safe direction.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -198,9 +200,78 @@ pub fn run_with_input(
 
 /// True when `program` resolves on PATH. Used for capability probes (`gh`,
 /// `curl`, `git`) so a missing tool degrades a feature instead of aborting.
+///
+/// Resolved in-process and memoised. The earlier version shelled out to
+/// `which`, which meant `compare()` spawned two extra processes per plugin, on
+/// every thread of a parallel inspection — a fleet host with twenty plugins
+/// paid forty process spawns to answer a question whose answer cannot change
+/// mid-run. PATH is read once per program and cached for the life of the
+/// process.
 pub fn have(program: &str) -> bool {
-    let probe = if cfg!(windows) { "where" } else { "which" };
-    matches!(run(probe, &[program], Duration::from_secs(5)), Ok(o) if o.ok())
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(program).copied())
+    {
+        return known;
+    }
+    let found = resolve(program).is_some();
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(program.to_string(), found);
+    }
+    found
+}
+
+/// The executable `program` names, searched the way the OS would search it.
+pub fn resolve(program: &str) -> Option<PathBuf> {
+    // An explicit path is not a PATH lookup — HERDR_BIN_PATH routinely carries
+    // one, and searching PATH for "/root/.local/bin/herdr" would find nothing.
+    if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
+        let path = PathBuf::from(program);
+        return executable(&path).then_some(path);
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path_var) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = directory.join(program);
+        if executable(&candidate) {
+            return Some(candidate);
+        }
+        // On Windows the extension is part of resolution, and PATHEXT is what
+        // decides which ones count.
+        if cfg!(windows) {
+            let extensions =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for extension in extensions.split(';').filter(|value| !value.is_empty()) {
+                let mut name = program.to_string();
+                name.push_str(extension);
+                let candidate = directory.join(name);
+                if executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn executable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -246,6 +317,28 @@ mod tests {
         .unwrap();
         assert!(o.ok());
         assert_eq!(o.trimmed(), "declarative-state");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_programs_through_path_without_spawning_which() {
+        assert!(have("sh"), "sh must resolve on any unix host");
+        assert!(!have("herdr-updater-no-such-binary"));
+        // Cached answers must stay stable across calls.
+        assert!(have("sh"));
+        assert!(resolve("/bin/sh").is_some());
+        assert!(resolve("/bin/definitely-not-here").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_on_path_is_not_a_program() {
+        let dir = std::env::temp_dir().join(format!("herdr-updater-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("herdr-updater-not-executable");
+        std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+        assert!(!executable(&plain));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -794,9 +794,6 @@ fn run(args: &mut Args) -> i32 {
         println!("herdr-updater {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
-    if args.command == "fleet" {
-        return fleet::cmd_fleet(&args.hosts, args.timeout, args.json);
-    }
     let bin = herdr_bin();
     let mut loaded = match config::load(args.config.as_deref(), &bin, args.timeout) {
         Ok(loaded) => loaded,
@@ -813,6 +810,9 @@ fn run(args: &mut Args) -> i32 {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     match args.command.as_str() {
+        // Loaded after the config rather than before it, so `max_concurrency`
+        // and a bad config are both honoured here too.
+        "fleet" => fleet::cmd_fleet(&args.hosts, &loaded.value, args.timeout, args.json),
         "check" | "plan" => check_or_plan(args, &loaded),
         "apply" | "update" => apply_report(args, &loaded, false),
         "startup" if !loaded.value.startup_check => 0,

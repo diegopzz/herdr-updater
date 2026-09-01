@@ -274,7 +274,7 @@ pub fn plan(
     }
     let (desired, desired_exists, mut warnings) =
         load_or_derive(config_dir, config, herdr_bin, timeout)?;
-    let (states, host_source) = fleet::collect_states(hosts, timeout);
+    let (states, host_source) = fleet::collect_states(hosts, config.max_concurrency, timeout);
     if host_source.is_none() {
         warnings.push("no fleet hosts file was found".into());
     }
