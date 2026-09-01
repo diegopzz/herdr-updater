@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Version = "0.2.0"
+$Version = "0.3.0"
 $Repository = "diegopzz/herdr-updater"
 $Root = Split-Path -Parent $PSScriptRoot
 $DevBinary = Join-Path $Root "target\release\herdr-updater.exe"
