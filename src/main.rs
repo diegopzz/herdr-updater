@@ -533,11 +533,11 @@ fn print_history(args: &Args, loaded: &config::Loaded) -> i32 {
         .map(|since| clock::now().saturating_sub(since.as_secs()));
     let mut selected: Vec<&history::Event> = events
         .iter()
-        .filter(|event| cutoff.map_or(true, |cutoff| event.unix_seconds >= cutoff))
+        .filter(|event| cutoff.is_none_or(|cutoff| event.unix_seconds >= cutoff))
         .filter(|event| {
             args.only
                 .as_ref()
-                .map_or(true, |target| &event.target == target)
+                .is_none_or(|target| &event.target == target)
         })
         .collect();
     if let Some(limit) = args.limit {
@@ -600,7 +600,7 @@ fn rollback_or_resume(args: &Args, loaded: &config::Loaded, resume: bool) -> i32
     let latest = history::latest_plugins(&events);
     let mut candidates: Vec<_> = latest
         .values()
-        .filter(|event| args.only.as_ref().map_or(true, |id| id == &event.target))
+        .filter(|event| args.only.as_ref().is_none_or(|id| id == &event.target))
         .filter(|event| {
             if resume {
                 event.kind == history::EventKind::PluginRolledBack

@@ -29,16 +29,42 @@ until you explicitly opt into `policy = "auto"`.
 ancestor of its upstream branch revision. Ahead, diverged, pinned, linked,
 unmanaged, rate-limited, unreachable, and otherwise unknown states are held.
 
-Herdr core updates have two additional gates:
+Herdr core is held under the same rule, not a looser one. Installed and
+published versions are **ordered**, never compared for inequality, so only a
+version that is genuinely newer is an update:
+
+| Relation | Meaning | Action |
+| --- | --- | --- |
+| `same` | Identical versions. | Current. |
+| `behind` | The manifest is newer. | The only relation that may be applied. |
+| `ahead` | This host is newer than the manifest. | Held — applying it would be a downgrade. |
+| `unknown` | A version this build cannot parse. | **Error**, not "current". |
+
+Versions follow semver precedence, so `0.10.0` is newer than `0.9.0` and
+`0.9.0-rc.1` is older than `0.9.0`. An unorderable pair exits `2` rather than
+reporting green, because a host running something we cannot read must never
+look like a host that is current.
+
+Three further gates apply to core:
 
 1. A running server must advertise live handoff.
 2. A protocol change is held unless it is explicitly allowed as part of a
    staged rollout (`allow_protocol_change = true` or
    `--allow-protocol-change`).
+3. The client must track the channel `latest.json` describes (`stable`).
+   A client on any other channel is being compared against a manifest that does
+   not describe it, which is held unless `allow_channel_mismatch = true`.
 
 After a core update, the CLI verifies the client/server version and refreshes
 outdated built-in agent integrations. After a plugin reinstall, it re-reads the
 plugin registry, verifies the resolved commit, and exercises action discovery.
+
+GitHub comparisons prefer an authenticated `gh` and fall back to the public
+API, which allows 60 requests an hour for the whole machine — one per
+GitHub-sourced plugin per inspection. Exhausting it is reported as
+`rate_limited` and exits `2`: a hold would read as green, and "we could not
+check" must never mean "current". `herdr-updater doctor` prints the remaining
+budget and when it resets.
 
 Every subprocess has a hard deadline and receives an argv array. User-derived
 owners, repositories, refs, subdirectories, and SSH aliases are validated
@@ -50,9 +76,20 @@ before they become arguments or URLs.
 herdr plugin install diegopzz/herdr-updater
 ```
 
-No Rust toolchain is required for a release install. The plugin launcher
-downloads the matching GitHub release binary on first use and verifies it
-against `checksums-<version>.txt`. The install step also places the standalone
+No Rust toolchain is required for a release install. Prebuilt binaries cover
+x86-64 and ARM64 Linux, Intel and Apple-silicon macOS, and x86-64 Windows. The
+plugin launcher downloads the matching GitHub release binary on first use and
+verifies it against `checksums-<version>.txt`.
+
+The checksum proves the archive arrived intact; provenance proves where it came
+from. Every release artifact is attested to the workflow, repository, and commit
+that produced it:
+
+```sh
+gh attestation verify herdr-updater-<version>-<target>.tar.gz \
+  --repo diegopzz/herdr-updater
+```
+ The install step also places the standalone
 `herdr-updater` binary in `~/.local/bin` on Unix or WindowsApps on Windows.
 
 For local development:
@@ -68,6 +105,7 @@ herdr plugin action list --plugin herdr-updater
 | Command | Behavior |
 | --- | --- |
 | `check` | Inspect core and plugins; never mutate. |
+| `doctor` | Check this tool's own environment and report what is degraded. |
 | `plan` | Show `CURRENT`, `UPDATE`, `HOLD`, or `ERROR` for each target. |
 | `apply` / `update` | Execute `UPDATE` decisions only when policy is `auto`. |
 | `fleet` | Report core version/protocol and plugin inventory drift over SSH. |
@@ -99,6 +137,7 @@ Common options:
 --allow-protocol-change
 --sort <relevance|stars|trending|recent|name>
 --limit <count>
+--since <duration>
 --refresh
 -y, --yes
 ```
@@ -111,6 +150,37 @@ Exit codes are stable for scripts:
 | `1` | An update needs attention, nothing can roll back/resume, or apply failed. |
 | `2` | A check is unknown or config/state is invalid. |
 | `3` | Command-line usage error. |
+
+## Diagnosing the updater itself
+
+Every other command reports on Herdr. `doctor` reports on this tool, because
+its characteristic failure is silence — a schedule that was never installed, a
+`curl` missing from `PATH`, a config directory that is not writable, a GitHub
+budget that ran out three plugins ago. Each produces a tool that runs, exits,
+and changes nothing, and the exit code alone never says which one fired.
+
+```sh
+herdr-updater doctor
+herdr-updater doctor --json
+```
+
+It checks the config file and any keys this build does not understand, the
+`herdr` binary and its status, the release manifest and the resulting core
+verdict, the five external tools and the capability each one gates, the GitHub
+API budget with its reset time, whether the state directory is writable,
+history integrity, the schedule and whether it is actually firing, and the
+fleet hosts file.
+
+| Level | Meaning | Exit |
+| --- | --- | --- |
+| `ok` | Checked, and working. | `0` |
+| `warn` | A capability is off or degraded; something you asked for will not happen. | `1` |
+| `fail` | A check this tool depends on cannot run, so its answers about that area are not answers. | `2` |
+
+Everything that is not `ok` carries a remedy. `doctor` loads its own config
+rather than inheriting one, so a config file that will not parse is reported as
+a `fail` and the remaining checks still run — aborting there would answer the
+question with the same silence being diagnosed.
 
 ## Configuration
 
@@ -131,6 +201,13 @@ allow = ["diegopzz/herdr-*"]
 An empty allowlist means all valid GitHub plugin sources are eligible, while
 `trusted_owners` narrows that set by owner. Tag/commit pins remain immutable.
 Fast-forward-only enforcement cannot be disabled.
+
+Misspelled settings are refused rather than ignored. `trusted_owner` parses
+cleanly under a defaulted config and silently means *no owner restriction at
+all*, so any key within a small edit distance of a real one is an error naming
+the key you meant. A key resembling nothing known only warns and is reported in
+`check`, `plan`, and `doctor` output, because an older host mid-rollout must
+not fail on a setting introduced by a newer build.
 
 Every timing value is customizable with `s`, `m`, `h`, and `d` units, including
 compound values such as `1h30m`:
@@ -182,12 +259,33 @@ and the native Herdr install preview before confirming it.
 
 ## Fleet inventory
 
-`fleet` reads the first existing file:
+`fleet` reads the first of these that exists, and the report always names the
+one it actually used:
 
-1. `~/.config/herdr-updater/hosts.toml`
-2. `~/.config/herdr-mirror/hosts.toml`
+1. `~/.config/herdr-updater/hosts.toml` — this plugin's own file.
+2. `~/.config/herdr-mirror/hosts.toml` — the file belonging to
+   [`herdr-mirror`](https://github.com/diegopzz/herdr-mirror), a **separate
+   Herdr plugin** that mirrors remote Herdr servers into your local sidebar and
+   drives them over SSH.
 
-The shared shape is intentionally small:
+The second path is a deliberate fallback, not a copy and not a dependency.
+`herdr-mirror` does a different job, but it needs the same answer to the same
+question — *which machines are mine, and what is each one called over SSH?* —
+and anyone running both has already written that list once. Reading it means a
+host added for mirroring is automatically a host this tool keeps updated, with
+no second list to forget. Neither plugin requires the other: if you do not run
+`herdr-mirror`, create the first file and the fallback never applies. If you do
+run both, create the first file only when the two need different host sets,
+because it wins outright rather than merging.
+
+The two plugins are affected differently by a protocol split, which is why
+`fleet` says so explicitly rather than warning about "the fleet" in general:
+`herdr --remote` negotiates the protocol, so a local client cannot attach
+across a split, while `herdr-mirror` runs the *remote* host's own herdr binary,
+so both ends of that conversation already agree.
+
+The shared shape is intentionally small, and is the same file `herdr-mirror`
+reads:
 
 ```toml
 [hosts.laptop]
@@ -198,9 +296,11 @@ target = "server"
 ```
 
 Targets are SSH aliases, so ProxyJump/ProxyCommand and keys stay in
-`~/.ssh/config`; this repository contains no credentials. Fleet mode is
-read-only. A host that cannot return either core status or plugin inventory is
-unknown and excluded from agreement claims.
+`~/.ssh/config`; this repository contains no credentials. `[hosts.laptop]` with
+no `target` means `ssh laptop`, matching `herdr-mirror`. Fleet mode is
+read-only, and fans out over at most `max_concurrency` hosts at a time. A host
+that cannot return either core status or plugin inventory is unknown and
+excluded from agreement claims.
 
 ## Fleet synchronization
 
@@ -228,6 +328,16 @@ For unattended fleet reconciliation, enable both `policy = "auto"` and
 `scheduled_fleet_sync = true`, then install the schedule. Notify policy still
 produces plans but performs no background writes.
 
+Timestamps in `history` and `schedule status` are UTC, so the same log reads
+the same way on every host in a fleet. `history` accepts `--limit`, `--since`,
+and `--only`, applied in that order, so `--limit` always means the most recent
+entries rather than the first ones in the file:
+
+```sh
+herdr-updater history --since 7d
+herdr-updater history --only herdr-mirror --limit 5
+```
+
 ## Roadmap status
 
 - [x] Safe Herdr core and plugin update planning and application.
@@ -239,6 +349,10 @@ produces plans but performs no background writes.
 - [x] Fully configurable intervals, quiet hours, jitter, and retry backoff.
 - [x] User-scoped Linux, macOS, and Windows schedulers.
 - [x] Cross-platform CI and checksum-verified release artifacts.
+- [x] ARM64 Linux release binaries alongside x86-64 and both macOS targets.
+- [x] Signed build provenance for every release artifact.
+- [x] Version-ordered core updates that refuse to downgrade.
+- [x] `doctor` preflight for the updater's own environment.
 
 ## Development
 
@@ -250,7 +364,13 @@ cargo build --release --locked
 ```
 
 The crate deliberately keeps a small dependency surface: `crossterm`, `serde`,
-`serde_json`, and `toml`, all pinned by `Cargo.lock`.
+`serde_json`, and `toml`, all pinned by `Cargo.lock`. Advisories against that
+tree are checked weekly by `cargo audit` rather than on every pull request, so
+an advisory against a transitive dependency does not turn an unrelated review
+red.
+
+The minimum supported Rust version is declared in `Cargo.toml` and verified by
+CI against that exact toolchain — it is a tested claim, not a decoration.
 
 ## License
 

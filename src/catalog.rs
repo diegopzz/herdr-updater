@@ -982,7 +982,7 @@ fn current_platform() -> &'static str {
 }
 
 fn supports_current_platform(item: &CatalogItem) -> bool {
-    item.platforms.as_ref().map_or(true, |platforms| {
+    item.platforms.as_ref().is_none_or(|platforms| {
         platforms
             .iter()
             .any(|platform| platform == current_platform())
