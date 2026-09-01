@@ -2,7 +2,11 @@
 name = "herdr-updater"
 version = "0.1.4"
 edition = "2021"
-rust-version = "1.74"
+# Verified by the MSRV job in CI, not asserted. 1.74 was declared and never
+# checked; it has not built since a transitive dependency moved to edition
+# 2024, which needs Cargo 1.85. Lowering this again means pinning those
+# dependencies back, deliberately.
+rust-version = "1.85"
 description = "Update Herdr safely with a plugin store, fleet sync, schedules, and rollback"
 repository = "https://github.com/diegopzz/herdr-updater"
 license = "MIT"

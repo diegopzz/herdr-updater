@@ -27,6 +27,13 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: herdr-updater
+          # Fleets run on ARM Linux — Raspberry Pi, Ampere and Graviton hosts,
+          # ARM Windows under WSL. Without this artifact the launcher exits 2
+          # with "no prebuilt binary" and the plugin simply cannot be installed
+          # there, which is a strange gap for a tool whose job is fleet drift.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: herdr-updater
           - os: macos-15-intel
             target: x86_64-apple-darwin
             executable: herdr-updater
@@ -73,6 +80,12 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Provenance is signed with a short-lived OIDC identity; both are needed
+      # and neither is inherited from the workflow-level `contents: write`.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -87,6 +100,16 @@ jobs:
             Sort-Object Name |
             ForEach-Object { "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name }
           $lines | Set-Content -LiteralPath "dist/checksums-$version.txt" -Encoding utf8NoBOM
+      # A checksum proves the archive was not altered in transit. It says
+      # nothing about where the archive came from, which is the question that
+      # matters when the launcher downloads and executes it on first use.
+      # Attestation binds each artifact to this workflow, this repository and
+      # this commit, verifiable with `gh attestation verify`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/herdr-updater-*.tar.gz
+
       - name: Publish GitHub release
         shell: pwsh
         env:
